@@ -1,4 +1,4 @@
 from ._device import ElgatoDockDevice
-from ._factory import driver_factory
+from ._factory import component, driver_factory
 
-__all__ = ["ElgatoDockDevice", "driver_factory"]
+__all__ = ["ElgatoDockDevice", "component", "driver_factory"]

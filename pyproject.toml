@@ -17,8 +17,8 @@ dependencies = [
     "streamdeck>=0.9.8,<0.10.0",
 ]
 
-[project.entry-points."deckr.drivers"]
-elgato = "deckr.drivers.elgato:driver_factory"
+[project.entry-points."deckr.components"]
+"deckr.drivers.elgato" = "deckr.drivers.elgato:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-driver-elgato#readme"

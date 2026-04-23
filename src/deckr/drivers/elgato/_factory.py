@@ -1,7 +1,13 @@
 import anyio
-from deckr.drivers.elgato._discovery import discover_elgato_devices
 from deckr.core.component import BaseComponent, RunContext
+from deckr.core.components import (
+    ComponentContext,
+    ComponentDefinition,
+    ComponentManifest,
+)
 from deckr.core.messaging import EventBus
+
+from deckr.drivers.elgato._discovery import discover_elgato_devices
 
 
 class ElgatoDeviceFactory(BaseComponent):
@@ -25,3 +31,17 @@ class ElgatoDeviceFactory(BaseComponent):
 
 def driver_factory(event_bus: EventBus) -> ElgatoDeviceFactory:
     return ElgatoDeviceFactory(event_bus=event_bus)
+
+
+def component_factory(context: ComponentContext) -> ElgatoDeviceFactory:
+    return driver_factory(context.require_lane("hardware_events"))
+
+
+component = ComponentDefinition(
+    manifest=ComponentManifest(
+        component_id="deckr.drivers.elgato",
+        config_prefix="deckr.drivers.elgato",
+        publishes=("hardware_events",),
+    ),
+    factory=component_factory,
+)
