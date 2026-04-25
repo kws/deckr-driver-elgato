@@ -1,16 +1,19 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
+
 import anyio
-from deckr.drivers.elgato._device import launch_device
-import logging
-from deckr.hardware.events import DeviceConnectedEvent, DeviceDisconnectedEvent
+from deckr.hardware import events as hw_events
+from deckr.transports.bus import EventBus
 from StreamDeck.DeviceManager import DeviceManager
+
+from deckr.drivers.elgato._device import launch_device
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def discover_elgato_devices():
+async def discover_elgato_devices(event_bus: EventBus):
     """
     The discovery loop manages StreamDeck device connections. It discovers the first
     available device and opens it. If the device disconnects, it will be re-discovered
@@ -32,7 +35,13 @@ async def discover_elgato_devices():
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(discover_loop, discovery_send, device_connected)
-        tg.start_soon(launcher_loop, discovery_receive, send_stream, device_connected)
+        tg.start_soon(
+            launcher_loop,
+            discovery_receive,
+            send_stream,
+            event_bus,
+            device_connected,
+        )
         yield receive_stream
 
 
@@ -59,17 +68,19 @@ async def discover_loop(
 async def launcher_loop(
     receive_stream: anyio.abc.ObjectReceiveStream[Any],
     send_stream: anyio.abc.ObjectSendStream[Any],
+    event_bus: EventBus,
     device_connected: list[bool],
 ):
     """Launch devices as they are discovered."""
     async with anyio.create_task_group() as tg:
         async for device in receive_stream:
-            tg.start_soon(device_loop, device, send_stream, device_connected)
+            tg.start_soon(device_loop, device, send_stream, event_bus, device_connected)
 
 
 async def device_loop(
     device: Any,
     send_stream: anyio.abc.ObjectSendStream[Any],
+    event_bus: EventBus,
     device_connected: list[bool],
 ):
     """Handle a single device's lifecycle."""
@@ -86,10 +97,31 @@ async def device_loop(
 
             logger.info("Device connected: %s", device_id)
             await send_stream.send(
-                DeviceConnectedEvent(device_id=device_id, device=my_device)
+                hw_events.DeviceConnectedMessage(
+                    device_id=device_id,
+                    device=hw_events.WireHWDevice(
+                        id=my_device.id,
+                        hid=my_device.hid,
+                        slots=list(my_device.slots),
+                        name=getattr(my_device, "name", None),
+                    ),
+                )
             )
-            async for event in my_device.subscribe():
-                await send_stream.send(event)
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    _run_until_complete,
+                    tg.cancel_scope,
+                    _forward_device_events,
+                    my_device,
+                    send_stream,
+                )
+                tg.start_soon(
+                    _run_until_complete,
+                    tg.cancel_scope,
+                    _apply_device_commands,
+                    my_device,
+                    event_bus,
+                )
 
     except cancelled as e:
         raise e
@@ -101,4 +133,37 @@ async def device_loop(
         # Signal device disconnected
         device_connected[0] = False
         if device_id is not None:
-            await send_stream.send(DeviceDisconnectedEvent(device_id=device_id))
+            await send_stream.send(hw_events.DeviceDisconnectedMessage(device_id=device_id))
+
+
+async def _forward_device_events(
+    device: Any,
+    send_stream: anyio.abc.ObjectSendStream[Any],
+) -> None:
+    async for event in device.subscribe():
+        await send_stream.send(event)
+
+
+async def _run_until_complete(cancel_scope, func, *args) -> None:
+    try:
+        await func(*args)
+    finally:
+        cancel_scope.cancel()
+
+
+async def _apply_device_commands(device: Any, event_bus: EventBus) -> None:
+    async with event_bus.subscribe() as stream:
+        async for envelope in stream:
+            message = envelope.message
+            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
+                continue
+            if message.device_id != device.id:
+                continue
+            if isinstance(message, hw_events.SetImageMessage):
+                await device.set_image(message.slot_id, message.image)
+            elif isinstance(message, hw_events.ClearSlotMessage):
+                await device.clear_slot(message.slot_id)
+            elif isinstance(message, hw_events.SleepScreenMessage):
+                await device.sleep_screen()
+            elif isinstance(message, hw_events.WakeScreenMessage):
+                await device.wake_screen()

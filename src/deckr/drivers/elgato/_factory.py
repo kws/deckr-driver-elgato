@@ -5,7 +5,7 @@ from deckr.core.components import (
     ComponentDefinition,
     ComponentManifest,
 )
-from deckr.core.messaging import EventBus
+from deckr.transports.bus import EventBus
 
 from deckr.drivers.elgato._discovery import discover_elgato_devices
 
@@ -19,7 +19,7 @@ class ElgatoDeviceFactory(BaseComponent):
     async def start(self, ctx: RunContext) -> None:
         async with anyio.create_task_group() as tg:
             self.__cancel_scope = tg.cancel_scope
-            async with discover_elgato_devices() as stream:
+            async with discover_elgato_devices(self.event_bus) as stream:
                 async for event in stream:
                     await self.event_bus.send(event)
 
@@ -41,6 +41,7 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.drivers.elgato",
         config_prefix="deckr.drivers.elgato",
+        consumes=("hardware_events",),
         publishes=("hardware_events",),
     ),
     factory=component_factory,

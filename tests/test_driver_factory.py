@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import anyio
 import pytest
-from deckr.core.messaging import EventBus
+from deckr.transports.bus import EventBus
 
 from deckr.drivers.elgato._discovery import discover_loop
 from deckr.drivers.elgato._factory import ElgatoDeviceFactory, driver_factory

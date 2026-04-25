@@ -1,13 +1,11 @@
 """Elgato Stream Deck device implementation."""
 
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import anyio
-
 import deckr.hardware.events as hw_events
-
 from StreamDeck.Devices.StreamDeck import StreamDeck
 
 logger = logging.getLogger(__name__)
@@ -30,23 +28,23 @@ class ElgatoDockDevice:
         self._slot_to_key_map = self._create_slot_to_key_map()
         self._key_to_slot_map = {v: k for k, v in self._slot_to_key_map.items()}
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
-            hw_events.HardwareEvent
+            hw_events.HardwareInputMessage
         ](max_buffer_size=100)
         self._device_id = None
         self._hid = None
         self._disconnected = False
 
-    def _create_slots(self) -> list[hw_events.HWSlot]:
-        """Create HWSlot objects for all keys on the device."""
+    def _create_slots(self) -> list[hw_events.WireHWSlot]:
+        """Create WireHWSlot objects for all keys on the device."""
         slots = []
         for row in range(self._rows):
             for col in range(self._cols):
                 slot_id = f"{col},{row}"
                 slots.append(
-                    hw_events.HWSlot(
+                    hw_events.WireHWSlot(
                         id=slot_id,
-                        coordinates=hw_events.Coordinates(column=col, row=row),
-                        image_format=hw_events.HWSImageFormat(
+                        coordinates=hw_events.WireCoordinates(column=col, row=row),
+                        image_format=hw_events.WireHWSImageFormat(
                             width=72,
                             height=72,
                             format="JPEG",
@@ -106,8 +104,8 @@ class ElgatoDockDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_events.HWSlot]:
-        """Return list of HWSlot objects for all keys."""
+    def slots(self) -> list[hw_events.WireHWSlot]:
+        """Return list of WireHWSlot objects for all keys."""
         return self._slots
 
     async def wake_screen(self) -> None:
@@ -146,7 +144,7 @@ class ElgatoDockDevice:
         await anyio.to_thread.run_sync(self._device.set_brightness, value)
 
     async def set_image(self, slot_id: str, image: bytes) -> None:
-        """Set a key image (HWDevice protocol method).
+        """Set a key image on the private live device.
 
         Args:
             slot_id: Slot identifier (e.g., "0,0")
@@ -196,7 +194,7 @@ class ElgatoDockDevice:
             raise
 
     async def clear_slot(self, slot_id: str) -> None:
-        """Clear a slot (HWDevice protocol method).
+        """Clear a slot on the private live device.
 
         Args:
             slot_id: Slot identifier (e.g., "0,0")
@@ -235,7 +233,7 @@ class ElgatoDockDevice:
                 return
             raise
 
-    async def subscribe(self) -> AsyncIterator[hw_events.HardwareEvent]:
+    async def subscribe(self) -> AsyncIterator[hw_events.HardwareInputMessage]:
         """Subscribe to hardware events from the device."""
         # The device callback will send events to _event_send
         # We need to detect if the device disconnects
@@ -261,9 +259,9 @@ class ElgatoDockDevice:
 
             device_id = self.id
             if state:
-                event = hw_events.KeyDownEvent(device_id=device_id, key_id=slot_id)
+                event = hw_events.KeyDownMessage(device_id=device_id, key_id=slot_id)
             else:
-                event = hw_events.KeyUpEvent(device_id=device_id, key_id=slot_id)
+                event = hw_events.KeyUpMessage(device_id=device_id, key_id=slot_id)
 
             await self._event_send.send(event)
 
