@@ -99,7 +99,7 @@ async def device_loop(
             await send_stream.send(
                 hw_events.DeviceConnectedMessage(
                     device_id=device_id,
-                    device=hw_events.WireHWDevice(
+                    device=hw_events.HardwareDevice(
                         id=my_device.id,
                         hid=my_device.hid,
                         slots=list(my_device.slots),

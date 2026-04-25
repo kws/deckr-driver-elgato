@@ -34,17 +34,17 @@ class ElgatoDockDevice:
         self._hid = None
         self._disconnected = False
 
-    def _create_slots(self) -> list[hw_events.WireHWSlot]:
-        """Create WireHWSlot objects for all keys on the device."""
+    def _create_slots(self) -> list[hw_events.HardwareSlot]:
+        """Create HardwareSlot objects for all keys on the device."""
         slots = []
         for row in range(self._rows):
             for col in range(self._cols):
                 slot_id = f"{col},{row}"
                 slots.append(
-                    hw_events.WireHWSlot(
+                    hw_events.HardwareSlot(
                         id=slot_id,
-                        coordinates=hw_events.WireCoordinates(column=col, row=row),
-                        image_format=hw_events.WireHWSImageFormat(
+                        coordinates=hw_events.HardwareCoordinates(column=col, row=row),
+                        image_format=hw_events.HardwareImageFormat(
                             width=72,
                             height=72,
                             format="JPEG",
@@ -104,8 +104,8 @@ class ElgatoDockDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_events.WireHWSlot]:
-        """Return list of WireHWSlot objects for all keys."""
+    def slots(self) -> list[hw_events.HardwareSlot]:
+        """Return list of HardwareSlot objects for all keys."""
         return self._slots
 
     async def wake_screen(self) -> None:
