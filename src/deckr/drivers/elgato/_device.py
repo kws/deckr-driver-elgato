@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import anyio
-import deckr.hardware.events as hw_events
+import deckr.hardware.messages as hw_messages
 from StreamDeck.Devices.StreamDeck import StreamDeck
 
 logger = logging.getLogger(__name__)
@@ -28,23 +28,23 @@ class ElgatoDockDevice:
         self._slot_to_key_map = self._create_slot_to_key_map()
         self._key_to_slot_map = {v: k for k, v in self._slot_to_key_map.items()}
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
-            hw_events.HardwareInputMessage
+            hw_messages.HardwareInputMessage
         ](max_buffer_size=100)
         self._device_id = None
         self._hid = None
         self._disconnected = False
 
-    def _create_slots(self) -> list[hw_events.HardwareSlot]:
+    def _create_slots(self) -> list[hw_messages.HardwareSlot]:
         """Create HardwareSlot objects for all keys on the device."""
         slots = []
         for row in range(self._rows):
             for col in range(self._cols):
                 slot_id = f"{col},{row}"
                 slots.append(
-                    hw_events.HardwareSlot(
+                    hw_messages.HardwareSlot(
                         id=slot_id,
-                        coordinates=hw_events.HardwareCoordinates(column=col, row=row),
-                        image_format=hw_events.HardwareImageFormat(
+                        coordinates=hw_messages.HardwareCoordinates(column=col, row=row),
+                        image_format=hw_messages.HardwareImageFormat(
                             width=72,
                             height=72,
                             format="JPEG",
@@ -104,7 +104,7 @@ class ElgatoDockDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_events.HardwareSlot]:
+    def slots(self) -> list[hw_messages.HardwareSlot]:
         """Return list of HardwareSlot objects for all keys."""
         return self._slots
 
@@ -233,7 +233,7 @@ class ElgatoDockDevice:
                 return
             raise
 
-    async def subscribe(self) -> AsyncIterator[hw_events.HardwareInputMessage]:
+    async def subscribe(self) -> AsyncIterator[hw_messages.HardwareInputMessage]:
         """Subscribe to hardware events from the device."""
         # The device callback will send events to _event_send
         # We need to detect if the device disconnects
@@ -258,9 +258,9 @@ class ElgatoDockDevice:
                 return
 
             if state:
-                event = hw_events.KeyDownMessage(key_id=slot_id)
+                event = hw_messages.KeyDownMessage(key_id=slot_id)
             else:
-                event = hw_events.KeyUpMessage(key_id=slot_id)
+                event = hw_messages.KeyUpMessage(key_id=slot_id)
 
             await self._event_send.send(event)
 

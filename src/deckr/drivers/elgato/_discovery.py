@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import anyio
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.transports.bus import EventBus
 from StreamDeck.DeviceManager import DeviceManager
 
@@ -107,11 +107,11 @@ async def device_loop(
 
             logger.info("Device connected: %s", device_id)
             await send_stream.send(
-                hw_events.hardware_input_message(
+                hw_messages.hardware_input_message(
                     manager_id=manager_id,
                     device_id=device_id,
-                    body=hw_events.DeviceConnectedMessage(
-                        device=hw_events.HardwareDevice(
+                    body=hw_messages.DeviceConnectedMessage(
+                        device=hw_messages.HardwareDevice(
                             id=my_device.id,
                             fingerprint=my_device.hid,
                             hid=my_device.hid,
@@ -150,10 +150,10 @@ async def device_loop(
         device_connected[0] = False
         if device_id is not None:
             await send_stream.send(
-                hw_events.hardware_input_message(
+                hw_messages.hardware_input_message(
                     manager_id=manager_id,
                     device_id=device_id,
-                    body=hw_events.DeviceDisconnectedMessage(),
+                    body=hw_messages.DeviceDisconnectedMessage(),
                 )
             )
 
@@ -165,7 +165,7 @@ async def _forward_device_events(
 ) -> None:
     async for event in device.subscribe():
         await send_stream.send(
-            hw_events.hardware_input_message(
+            hw_messages.hardware_input_message(
                 manager_id=manager_id,
                 device_id=device.id,
                 body=event,
@@ -187,20 +187,20 @@ async def _apply_device_commands(
 ) -> None:
     async with event_bus.subscribe() as stream:
         async for envelope in stream:
-            ref = hw_events.hardware_device_ref_from_message(envelope)
-            if ref != hw_events.HardwareDeviceRef(
+            ref = hw_messages.hardware_device_ref_from_message(envelope)
+            if ref != hw_messages.HardwareDeviceRef(
                 manager_id=manager_id,
                 device_id=device.id,
             ):
                 continue
-            message = hw_events.hardware_body_from_message(envelope)
-            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
+            message = hw_messages.hardware_body_from_message(envelope)
+            if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
                 continue
-            if isinstance(message, hw_events.SetImageMessage):
+            if isinstance(message, hw_messages.SetImageMessage):
                 await device.set_image(message.slot_id, message.image)
-            elif isinstance(message, hw_events.ClearSlotMessage):
+            elif isinstance(message, hw_messages.ClearSlotMessage):
                 await device.clear_slot(message.slot_id)
-            elif isinstance(message, hw_events.SleepScreenMessage):
+            elif isinstance(message, hw_messages.SleepScreenMessage):
                 await device.sleep_screen()
-            elif isinstance(message, hw_events.WakeScreenMessage):
+            elif isinstance(message, hw_messages.WakeScreenMessage):
                 await device.wake_screen()

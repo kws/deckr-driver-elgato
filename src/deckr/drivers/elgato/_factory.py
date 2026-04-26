@@ -53,7 +53,7 @@ def component_factory(context: ComponentContext) -> ElgatoDeviceFactory:
     if not manager_id:
         raise ValueError("deckr.drivers.elgato requires manager_id")
     return driver_factory(
-        context.require_lane("hardware_events"),
+        context.require_lane("hardware_messages"),
         manager_id=manager_id,
     )
 
@@ -62,8 +62,8 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.drivers.elgato",
         config_prefix="deckr.drivers.elgato",
-        consumes=("hardware_events",),
-        publishes=("hardware_events",),
+        consumes=("hardware_messages",),
+        publishes=("hardware_messages",),
     ),
     factory=component_factory,
 )

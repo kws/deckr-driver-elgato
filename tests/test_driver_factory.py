@@ -17,7 +17,7 @@ class _FakeDeviceManager:
 
 
 def test_driver_factory_returns_elgato_device_factory() -> None:
-    factory = driver_factory(EventBus("hardware_events"), manager_id="elgato-main")
+    factory = driver_factory(EventBus("hardware_messages"), manager_id="elgato-main")
 
     assert isinstance(factory, ElgatoDeviceFactory)
 
