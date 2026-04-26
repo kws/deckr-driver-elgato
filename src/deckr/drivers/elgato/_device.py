@@ -257,11 +257,10 @@ class ElgatoDockDevice:
                 logger.warning(f"Slot not found for key: {key}")
                 return
 
-            device_id = self.id
             if state:
-                event = hw_events.KeyDownMessage(device_id=device_id, key_id=slot_id)
+                event = hw_events.KeyDownMessage(key_id=slot_id)
             else:
-                event = hw_events.KeyUpMessage(device_id=device_id, key_id=slot_id)
+                event = hw_events.KeyUpMessage(key_id=slot_id)
 
             await self._event_send.send(event)
 
