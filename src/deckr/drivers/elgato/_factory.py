@@ -1,11 +1,12 @@
 import anyio
-from deckr.contracts.messages import hardware_manager_address
-from deckr.core.component import BaseComponent, RunContext
-from deckr.core.components import (
+from deckr.components import (
+    BaseComponent,
     ComponentContext,
     ComponentDefinition,
     ComponentManifest,
+    RunContext,
 )
+from deckr.contracts.messages import hardware_manager_address
 from deckr.transports.bus import EventBus
 
 from deckr.drivers.elgato._discovery import discover_elgato_devices
