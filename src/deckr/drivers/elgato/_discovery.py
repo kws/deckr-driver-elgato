@@ -113,6 +113,7 @@ async def device_loop(
                     body=hw_events.DeviceConnectedMessage(
                         device=hw_events.HardwareDevice(
                             id=my_device.id,
+                            fingerprint=my_device.hid,
                             hid=my_device.hid,
                             slots=list(my_device.slots),
                             name=getattr(my_device, "name", None),
@@ -186,9 +187,11 @@ async def _apply_device_commands(
 ) -> None:
     async with event_bus.subscribe() as stream:
         async for envelope in stream:
-            if hw_events.hardware_manager_id_from_message(envelope) != manager_id:
-                continue
-            if hw_events.subject_device_id(envelope.subject) != device.id:
+            ref = hw_events.hardware_device_ref_from_message(envelope)
+            if ref != hw_events.HardwareDeviceRef(
+                manager_id=manager_id,
+                device_id=device.id,
+            ):
                 continue
             message = hw_events.hardware_body_from_message(envelope)
             if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):

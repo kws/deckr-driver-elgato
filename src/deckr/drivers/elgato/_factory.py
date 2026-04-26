@@ -1,4 +1,5 @@
 import anyio
+from deckr.contracts.messages import hardware_manager_address
 from deckr.core.component import BaseComponent, RunContext
 from deckr.core.components import (
     ComponentContext,
@@ -18,14 +19,22 @@ class ElgatoDeviceFactory(BaseComponent):
         self.__cancel_scope = None
 
     async def start(self, ctx: RunContext) -> None:
+        endpoint = str(hardware_manager_address(self.manager_id))
+        client_id = await self.event_bus.claim_local_endpoint(endpoint)
         async with anyio.create_task_group() as tg:
-            self.__cancel_scope = tg.cancel_scope
-            async with discover_elgato_devices(
-                self.event_bus,
-                manager_id=self.manager_id,
-            ) as stream:
-                async for event in stream:
-                    await self.event_bus.send(event)
+            try:
+                self.__cancel_scope = tg.cancel_scope
+                async with discover_elgato_devices(
+                    self.event_bus,
+                    manager_id=self.manager_id,
+                ) as stream:
+                    async for event in stream:
+                        await self.event_bus.send(event)
+            finally:
+                await self.event_bus.withdraw_local_endpoint(
+                    endpoint=endpoint,
+                    client_id=client_id,
+                )
 
     async def stop(self) -> None:
         with anyio.CancelScope(shield=True):
