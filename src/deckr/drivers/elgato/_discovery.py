@@ -1,10 +1,11 @@
 import logging
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
-from deckr.transports.bus import EventBus
 from StreamDeck.DeviceManager import DeviceManager
 
 from deckr.drivers.elgato._device import launch_device
@@ -12,8 +13,20 @@ from deckr.drivers.elgato._device import launch_device
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class ResetDeviceCommand:
+    pass
+
+
+DeviceCommand = DeckrMessage | ResetDeviceCommand
+
+
 @asynccontextmanager
-async def discover_elgato_devices(event_bus: EventBus, *, manager_id: str):
+async def discover_elgato_devices(
+    *,
+    manager_id: str,
+    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] | None = None,
+):
     """
     The discovery loop manages StreamDeck device connections. It discovers the first
     available device and opens it. If the device disconnects, it will be re-discovered
@@ -29,6 +42,8 @@ async def discover_elgato_devices(event_bus: EventBus, *, manager_id: str):
     discovery_send, discovery_receive = anyio.create_memory_object_stream[Any](
         max_buffer_size=100
     )
+    if command_streams is None:
+        command_streams = {}
 
     # Track if a device is currently connected (using a list to allow mutation from nested functions)
     device_connected = [False]
@@ -39,9 +54,9 @@ async def discover_elgato_devices(event_bus: EventBus, *, manager_id: str):
             launcher_loop,
             discovery_receive,
             send_stream,
-            event_bus,
             device_connected,
             manager_id,
+            command_streams,
         )
         yield receive_stream
 
@@ -69,9 +84,9 @@ async def discover_loop(
 async def launcher_loop(
     receive_stream: anyio.abc.ObjectReceiveStream[Any],
     send_stream: anyio.abc.ObjectSendStream[Any],
-    event_bus: EventBus,
     device_connected: list[bool],
     manager_id: str,
+    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
 ):
     """Launch devices as they are discovered."""
     async with anyio.create_task_group() as tg:
@@ -80,18 +95,18 @@ async def launcher_loop(
                 device_loop,
                 device,
                 send_stream,
-                event_bus,
                 device_connected,
                 manager_id,
+                command_streams,
             )
 
 
 async def device_loop(
     device: Any,
     send_stream: anyio.abc.ObjectSendStream[Any],
-    event_bus: EventBus,
     device_connected: list[bool],
     manager_id: str,
+    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
 ):
     """Handle a single device's lifecycle."""
     cancelled = anyio.get_cancelled_exc_class()
@@ -104,6 +119,10 @@ async def device_loop(
 
             device_id = my_device.id
             device_connected[0] = True  # Signal device is connected
+            command_send, command_receive = anyio.create_memory_object_stream[
+                DeviceCommand
+            ](max_buffer_size=100)
+            command_streams[device_id] = command_send
 
             logger.info("Device connected: %s", device_id)
             await send_stream.send(
@@ -121,23 +140,27 @@ async def device_loop(
                     ),
                 )
             )
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(
-                    _run_until_complete,
-                    tg.cancel_scope,
-                    _forward_device_events,
-                    my_device,
-                    send_stream,
-                    manager_id,
-                )
-                tg.start_soon(
-                    _run_until_complete,
-                    tg.cancel_scope,
-                    _apply_device_commands,
-                    my_device,
-                    event_bus,
-                    manager_id,
-                )
+            async with command_send, command_receive:
+                try:
+                    async with anyio.create_task_group() as tg:
+                        tg.start_soon(
+                            _run_until_complete,
+                            tg.cancel_scope,
+                            _forward_device_events,
+                            my_device,
+                            send_stream,
+                            manager_id,
+                        )
+                        tg.start_soon(
+                            _run_until_complete,
+                            tg.cancel_scope,
+                            _apply_device_commands,
+                            my_device,
+                            command_receive,
+                            manager_id,
+                        )
+                finally:
+                    command_streams.pop(device_id, None)
 
     except cancelled as e:
         raise e
@@ -182,25 +205,29 @@ async def _run_until_complete(cancel_scope, func, *args) -> None:
 
 async def _apply_device_commands(
     device: Any,
-    event_bus: EventBus,
+    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
     manager_id: str,
 ) -> None:
-    async with event_bus.subscribe() as stream:
-        async for envelope in stream:
-            ref = hw_messages.hardware_device_ref_from_message(envelope)
-            if ref != hw_messages.HardwareDeviceRef(
-                manager_id=manager_id,
-                device_id=device.id,
-            ):
-                continue
-            message = hw_messages.hardware_body_from_message(envelope)
-            if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
-                continue
-            if isinstance(message, hw_messages.SetImageMessage):
-                await device.set_image(message.slot_id, message.image)
-            elif isinstance(message, hw_messages.ClearSlotMessage):
-                await device.clear_slot(message.slot_id)
-            elif isinstance(message, hw_messages.SleepScreenMessage):
-                await device.sleep_screen()
-            elif isinstance(message, hw_messages.WakeScreenMessage):
-                await device.wake_screen()
+    async for command in command_stream:
+        if isinstance(command, ResetDeviceCommand):
+            await device.clear_key()
+            await device.refresh()
+            continue
+        envelope = command
+        ref = hw_messages.hardware_device_ref_from_message(envelope)
+        if ref != hw_messages.HardwareDeviceRef(
+            manager_id=manager_id,
+            device_id=device.id,
+        ):
+            continue
+        message = hw_messages.hardware_body_from_message(envelope)
+        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+            continue
+        if isinstance(message, hw_messages.SetImageMessage):
+            await device.set_image(message.slot_id, message.image)
+        elif isinstance(message, hw_messages.ClearSlotMessage):
+            await device.clear_slot(message.slot_id)
+        elif isinstance(message, hw_messages.SleepScreenMessage):
+            await device.sleep_screen()
+        elif isinstance(message, hw_messages.WakeScreenMessage):
+            await device.wake_screen()
