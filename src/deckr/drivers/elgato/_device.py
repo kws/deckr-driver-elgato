@@ -3,12 +3,156 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any
 
 import anyio
-import deckr.hardware.messages as hw_messages
+from deckr.hardware.descriptors import (
+    DECKR_DEVICE_POWER,
+    DECKR_INPUT_BUTTON,
+    DECKR_OUTPUT_RASTER,
+    CapabilityDescriptor,
+    CapabilityRef,
+    CapabilitySchema,
+    ControlDescriptor,
+    ControlGeometry,
+    DeviceConnection,
+    DeviceDescriptor,
+    DeviceIdentifier,
+    DeviceSourceReference,
+)
 from StreamDeck.Devices.StreamDeck import StreamDeck
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ControlInputEvent:
+    control_id: str
+    capability_id: str
+    event_type: str
+    value: dict[str, Any]
+
+
+def _button_value_schema(events: tuple[str, ...], schema_id: str) -> CapabilitySchema:
+    return CapabilitySchema.model_validate(
+        {
+            "schemaId": schema_id,
+            "schema": {
+                "type": "object",
+                "required": ["eventType"],
+                "properties": {"eventType": {"enum": list(events)}},
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _raster_command_schema(width: int, height: int) -> CapabilitySchema:
+    return CapabilitySchema.model_validate(
+        {
+            "schemaId": "deckr.command.output.raster.bitmap.v1",
+            "schema": {
+                "type": "object",
+                "required": ["commandType"],
+                "properties": {
+                    "commandType": {"enum": ["set_frame", "clear"]},
+                    "image": {"type": "string", "contentEncoding": "base64"},
+                    "encoding": {"enum": ["jpeg", "png"]},
+                    "width": {"const": width},
+                    "height": {"const": height},
+                },
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _momentary_button_capability() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="button.momentary",
+        family=DECKR_INPUT_BUTTON,
+        type="momentary",
+        direction="input",
+        access=("emits",),
+        valueSchema=_button_value_schema(
+            ("down", "up"),
+            "deckr.value.input.button.momentary.v1",
+        ),
+        eventTypes=("down", "up"),
+    )
+
+
+def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="button.press",
+        family=DECKR_INPUT_BUTTON,
+        type="activation",
+        direction="input",
+        access=("emits",),
+        valueSchema=_button_value_schema(
+            ("press",),
+            "deckr.value.input.button.activation.v1",
+        ),
+        eventTypes=("press",),
+        projection={
+            "owner": "hardware_manager",
+            "source": {
+                "controlId": control_id,
+                "capabilityId": "button.momentary",
+            },
+        },
+    )
+
+
+def _raster_capability(width: int, height: int, rotation: int) -> CapabilityDescriptor:
+    return CapabilityDescriptor.model_validate(
+        {
+            "capabilityId": "raster.bitmap",
+            "family": DECKR_OUTPUT_RASTER,
+            "type": "bitmap",
+            "direction": "output",
+            "access": ["settable"],
+            "commandSchema": _raster_command_schema(width, height).model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            ),
+            "commandTypes": ["set_frame", "clear"],
+            "constraints": [
+                {"type": "fixed", "subject": "width", "value": width, "unit": "pixel"},
+                {
+                    "type": "fixed",
+                    "subject": "height",
+                    "value": height,
+                    "unit": "pixel",
+                },
+                {
+                    "type": "fixed",
+                    "subject": "rotation",
+                    "value": rotation,
+                    "unit": "degree",
+                },
+                {"type": "enum", "subject": "encoding", "values": ["jpeg", "png"]},
+            ],
+            "units": [
+                {"subject": "width", "unit": "pixel"},
+                {"subject": "height", "unit": "pixel"},
+                {"subject": "rotation", "unit": "degree"},
+            ],
+        }
+    )
+
+
+def _power_capability() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="device.power",
+        family=DECKR_DEVICE_POWER,
+        type="screen",
+        direction="command",
+        access=("invokable",),
+        commandTypes=("sleep", "wake"),
+    )
 
 
 class ElgatoDockDevice:
@@ -24,36 +168,55 @@ class ElgatoDockDevice:
         """
         self._device = device
         self._rows, self._cols = device.key_layout()
-        self._slots = self._create_slots()
         self._slot_to_key_map = self._create_slot_to_key_map()
         self._key_to_slot_map = {v: k for k, v in self._slot_to_key_map.items()}
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
-            hw_messages.HardwareInputMessage
+            ControlInputEvent
         ](max_buffer_size=100)
         self._device_id = None
         self._hid = None
         self._disconnected = False
 
-    def _create_slots(self) -> list[hw_messages.HardwareSlot]:
-        """Create HardwareSlot objects for all keys on the device."""
-        slots = []
+    def _create_controls(self) -> list[ControlDescriptor]:
+        """Create v1 control descriptors for all keys on the device."""
+        controls = []
+        width = 72
+        height = 72
+        rotation = 180
+        connection_id = "usb-hid-0"
         for row in range(self._rows):
             for col in range(self._cols):
-                slot_id = f"{col},{row}"
-                slots.append(
-                    hw_messages.HardwareSlot(
-                        id=slot_id,
-                        coordinates=hw_messages.HardwareCoordinates(column=col, row=row),
-                        image_format=hw_messages.HardwareImageFormat(
-                            width=72,
-                            height=72,
-                            format="JPEG",
-                            rotation=180,
-                            format_options={"quality": 10},
+                control_id = f"{col},{row}"
+                controls.append(
+                    ControlDescriptor(
+                        controlId=control_id,
+                        kind="bitmap_key",
+                        label=f"Key {col},{row}",
+                        geometry=ControlGeometry(
+                            x=col,
+                            y=row,
+                            width=1,
+                            height=1,
+                            unit="grid",
+                        ),
+                        inputCapabilities=(
+                            _momentary_button_capability(),
+                            _activation_button_capability(control_id),
+                        ),
+                        outputCapabilities=(
+                            _raster_capability(width, height, rotation),
+                        ),
+                        sources=(
+                            DeviceSourceReference(
+                                sourceId=f"key-report-{col}-{row}",
+                                type="hid",
+                                connectionId=connection_id,
+                                facts={"keyIndex": row * self._cols + col},
+                            ),
                         ),
                     )
                 )
-        return slots
+        return controls
 
     def _create_slot_to_key_map(self) -> dict[str, int]:
         """Create mapping from slot_id (e.g., "0,0") to key index."""
@@ -104,9 +267,58 @@ class ElgatoDockDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_messages.HardwareSlot]:
-        """Return list of HardwareSlot objects for all keys."""
-        return self._slots
+    def descriptor(self) -> DeviceDescriptor:
+        """Return the canonical Deckr device descriptor for this device."""
+        vendor_id = None
+        product_id = None
+        try:
+            vendor_id = self._device.vendor_id()
+            product_id = self._device.product_id()
+        except Exception:
+            logger.debug("Could not read Elgato USB ids", exc_info=True)
+        serial = self.id
+        connections: list[DeviceConnection] = [
+            DeviceConnection(
+                connectionId="usb-hid-0",
+                type="hid",
+                status="connected",
+                transport="usb",
+                facts={
+                    key: value
+                    for key, value in {
+                        "vendorId": vendor_id,
+                        "productId": product_id,
+                        "serialNumber": serial,
+                    }.items()
+                    if value is not None
+                },
+            )
+        ]
+        identifiers: list[DeviceIdentifier] = []
+        if vendor_id is not None and product_id is not None:
+            identifiers.append(
+                DeviceIdentifier(
+                    type="usb.vendor_product",
+                    namespace="usb",
+                    value=f"{vendor_id:04x}:{product_id:04x}",
+                )
+            )
+        return DeviceDescriptor(
+            deviceId=self.id,
+            fingerprint=self.hid,
+            displayName=getattr(self._device, "deck_type", lambda: "Stream Deck")(),
+            manufacturer="Elgato",
+            model=getattr(self._device, "deck_type", lambda: None)(),
+            serialNumber=serial,
+            identifiers=tuple(identifiers),
+            connections=tuple(connections),
+            defaultStatusIndicator=CapabilityRef(
+                controlId="0,0",
+                capabilityId="raster.bitmap",
+            ),
+            capabilities=(_power_capability(),),
+            controls=tuple(self._create_controls()),
+        )
 
     async def wake_screen(self) -> None:
         """Wake the screen."""
@@ -233,7 +445,7 @@ class ElgatoDockDevice:
                 return
             raise
 
-    async def subscribe(self) -> AsyncIterator[hw_messages.HardwareInputMessage]:
+    async def subscribe(self) -> AsyncIterator[ControlInputEvent]:
         """Subscribe to hardware events from the device."""
         # The device callback will send events to _event_send
         # We need to detect if the device disconnects
@@ -258,11 +470,30 @@ class ElgatoDockDevice:
                 return
 
             if state:
-                event = hw_messages.KeyDownMessage(key_id=slot_id)
+                event = ControlInputEvent(
+                    control_id=slot_id,
+                    capability_id="button.momentary",
+                    event_type="down",
+                    value={"eventType": "down"},
+                )
+                await self._event_send.send(event)
             else:
-                event = hw_messages.KeyUpMessage(key_id=slot_id)
-
-            await self._event_send.send(event)
+                await self._event_send.send(
+                    ControlInputEvent(
+                        control_id=slot_id,
+                        capability_id="button.momentary",
+                        event_type="up",
+                        value={"eventType": "up"},
+                    )
+                )
+                await self._event_send.send(
+                    ControlInputEvent(
+                        control_id=slot_id,
+                        capability_id="button.press",
+                        event_type="press",
+                        value={"eventType": "press"},
+                    )
+                )
 
         except Exception as e:
             logger.exception(f"Error handling key event: {e}", exc_info=True)

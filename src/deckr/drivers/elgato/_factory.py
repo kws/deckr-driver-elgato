@@ -20,6 +20,7 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import EndpointLane, Lane
 from deckr.state import (
     DeviceClaim,
@@ -68,7 +69,7 @@ class ElgatoDeviceFactory(BaseComponent):
         self._session_id = str(uuid.uuid4())
         self._cancel_scope: anyio.CancelScope | None = None
         self._endpoint: EndpointLane | None = None
-        self._devices: dict[str, hw_messages.HardwareDevice] = {}
+        self._devices: dict[str, DeviceDescriptor] = {}
         self._claims: dict[str, DeviceClaim] = {}
         self._controller_presence_sessions: dict[EndpointAddress, str] = {}
         self._unroutable_devices: set[str] = set()
@@ -165,17 +166,27 @@ class ElgatoDeviceFactory(BaseComponent):
         ref = hw_messages.hardware_device_ref_from_message(message)
         if ref is None:
             return
-        if isinstance(event, hw_messages.DeviceConnectedMessage):
-            self._devices[ref.device_id] = event.device
+        if isinstance(event, hw_messages.DeviceAvailableMessage):
+            self._devices[ref.device_id] = event.descriptor
             await self._publish_inventory_safely()
+            await self._endpoint.publish(message)
             return
-        if isinstance(event, hw_messages.DeviceDisconnectedMessage):
+        if isinstance(event, hw_messages.DeviceDescriptorChangedMessage):
+            self._devices[ref.device_id] = event.descriptor
+            await self._publish_inventory_safely()
+            await self._endpoint.publish(message)
+            return
+        if isinstance(event, hw_messages.DeviceUnavailableMessage):
             self._devices.pop(ref.device_id, None)
             self._claims.pop(ref.device_id, None)
             self._unroutable_devices.discard(ref.device_id)
             await self._publish_inventory_safely()
+            await self._endpoint.publish(message)
             return
-        if not isinstance(event, hw_messages.HARDWARE_INPUT_MESSAGE_TYPES):
+        if not isinstance(
+            event,
+            hw_messages.ControlInputMessage | hw_messages.CapabilityStateChangedMessage,
+        ):
             return
         if ref.device_id not in self._devices:
             logger.debug("Dropping input for unknown Elgato device %s", ref.device_id)
@@ -212,14 +223,12 @@ class ElgatoDeviceFactory(BaseComponent):
                 ttlSeconds=PRESENCE_TTL_SECONDS,
                 devices={
                     device_id: HardwareInventoryDevice(
-                        deviceId=device_id,
-                        hardwareType=device.name or "elgato",
-                        fingerprint=device.fingerprint,
-                        descriptor=device.model_dump(
-                            by_alias=True,
-                            exclude_none=True,
-                            mode="json",
+                        deviceRef=DeviceRef(
+                            managerId=self.manager_id,
+                            deviceId=device_id,
+                            fingerprint=device.fingerprint,
                         ),
+                        descriptor=device,
                     )
                     for device_id, device in sorted(self._devices.items())
                 },
@@ -433,7 +442,10 @@ class ElgatoDeviceFactory(BaseComponent):
         if ref is None or ref.manager_id != self.manager_id:
             return
         message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+        if not isinstance(
+            message,
+            hw_messages.ControlCommandMessage | hw_messages.CapabilityStateRequestMessage,
+        ):
             return
         if ref.device_id not in self._devices:
             logger.debug(

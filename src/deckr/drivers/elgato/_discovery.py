@@ -1,3 +1,4 @@
+import base64
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -126,18 +127,9 @@ async def device_loop(
 
             logger.info("Device connected: %s", device_id)
             await send_stream.send(
-                hw_messages.hardware_input_message(
+                hw_messages.device_available_message(
                     manager_id=manager_id,
-                    device_id=device_id,
-                    body=hw_messages.DeviceConnectedMessage(
-                        device=hw_messages.HardwareDevice(
-                            id=my_device.id,
-                            fingerprint=my_device.hid,
-                            hid=my_device.hid,
-                            slots=list(my_device.slots),
-                            name=getattr(my_device, "name", None),
-                        ),
-                    ),
+                    descriptor=my_device.descriptor,
                 )
             )
             async with command_send, command_receive:
@@ -173,10 +165,10 @@ async def device_loop(
         device_connected[0] = False
         if device_id is not None:
             await send_stream.send(
-                hw_messages.hardware_input_message(
+                hw_messages.device_unavailable_message(
                     manager_id=manager_id,
                     device_id=device_id,
-                    body=hw_messages.DeviceDisconnectedMessage(),
+                    reason="disconnected",
                 )
             )
 
@@ -188,10 +180,14 @@ async def _forward_device_events(
 ) -> None:
     async for event in device.subscribe():
         await send_stream.send(
-            hw_messages.hardware_input_message(
+            hw_messages.control_input_message(
                 manager_id=manager_id,
                 device_id=device.id,
-                body=event,
+                fingerprint=device.hid,
+                control_id=event.control_id,
+                capability_id=event.capability_id,
+                event_type=event.event_type,
+                value=event.value,
             )
         )
 
@@ -215,19 +211,23 @@ async def _apply_device_commands(
             continue
         envelope = command
         ref = hw_messages.hardware_device_ref_from_message(envelope)
-        if ref != hw_messages.HardwareDeviceRef(
-            manager_id=manager_id,
-            device_id=device.id,
-        ):
+        if ref is None or ref.manager_id != manager_id or ref.device_id != device.id:
             continue
         message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+        if not isinstance(message, hw_messages.ControlCommandMessage):
             continue
-        if isinstance(message, hw_messages.SetImageMessage):
-            await device.set_image(message.slot_id, message.image)
-        elif isinstance(message, hw_messages.ClearSlotMessage):
-            await device.clear_slot(message.slot_id)
-        elif isinstance(message, hw_messages.SleepScreenMessage):
-            await device.sleep_screen()
-        elif isinstance(message, hw_messages.WakeScreenMessage):
-            await device.wake_screen()
+        if message.capability_id == "device.power":
+            if message.command_type == "wake":
+                await device.wake_screen()
+            elif message.command_type == "sleep":
+                await device.sleep_screen()
+            continue
+        if message.capability_id != "raster.bitmap" or message.control_id is None:
+            continue
+        if message.command_type == "set_frame":
+            encoded = message.params.get("image")
+            if not isinstance(encoded, str):
+                continue
+            await device.set_image(message.control_id, base64.b64decode(encoded))
+        elif message.command_type == "clear":
+            await device.clear_slot(message.control_id)

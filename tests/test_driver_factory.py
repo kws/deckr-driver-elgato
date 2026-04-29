@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -11,6 +12,16 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import (
+    DECKR_INPUT_BUTTON,
+    DECKR_OUTPUT_RASTER,
+    CapabilityDescriptor,
+    CapabilityRef,
+    ControlDescriptor,
+    ControlGeometry,
+    DeviceDescriptor,
+    DeviceRef,
+)
 from deckr.runtime import Deckr
 from deckr.state import (
     DeviceClaim,
@@ -42,20 +53,109 @@ def _deckr() -> Deckr:
     )
 
 
-def _device() -> hw_messages.HardwareDevice:
-    return hw_messages.HardwareDevice(
-        id="deck",
-        name="Stream Deck",
-        hid="hid:deck",
+def _control() -> ControlDescriptor:
+    return ControlDescriptor(
+        controlId="0,0",
+        kind="bitmap_key",
+        geometry=ControlGeometry(x=0, y=0, width=1, height=1, unit="grid"),
+        inputCapabilities=(
+            CapabilityDescriptor(
+                capabilityId="button.momentary",
+                family=DECKR_INPUT_BUTTON,
+                type="momentary",
+                direction="input",
+                access=("emits",),
+                eventTypes=("down", "up"),
+            ),
+            CapabilityDescriptor(
+                capabilityId="button.press",
+                family=DECKR_INPUT_BUTTON,
+                type="activation",
+                direction="input",
+                access=("emits",),
+                eventTypes=("press",),
+            ),
+        ),
+        outputCapabilities=(
+            CapabilityDescriptor.model_validate(
+                {
+                    "capabilityId": "raster.bitmap",
+                    "family": DECKR_OUTPUT_RASTER,
+                    "type": "bitmap",
+                    "direction": "output",
+                    "access": ["settable"],
+                    "commandTypes": ["set_frame", "clear"],
+                    "constraints": [
+                        {"type": "fixed", "subject": "width", "value": 72},
+                        {"type": "fixed", "subject": "height", "value": 72},
+                    ],
+                }
+            ),
+        ),
+    )
+
+
+def _device() -> DeviceDescriptor:
+    return DeviceDescriptor(
+        deviceId="deck",
+        displayName="Stream Deck",
         fingerprint="fingerprint:deck",
-        slots=[
-            hw_messages.HardwareSlot(
-                id="0,0",
-                coordinates=hw_messages.HardwareCoordinates(column=0, row=0),
-                image_format=hw_messages.HardwareImageFormat(width=72, height=72),
-                gestures=("key_down", "key_up"),
-            )
-        ],
+        controls=(_control(),),
+    )
+
+
+def _available_message() -> hw_messages.DeviceAvailableMessage:
+    return hw_messages.device_available_message(
+        manager_id="elgato-main",
+        descriptor=_device(),
+    )
+
+
+def _unavailable_message() -> hw_messages.DeviceUnavailableMessage:
+    return hw_messages.device_unavailable_message(
+        manager_id="elgato-main",
+        device_id="deck",
+        reason="test",
+    )
+
+
+def _input_message() -> hw_messages.ControlInputMessage:
+    return hw_messages.control_input_message(
+        manager_id="elgato-main",
+        device_id="deck",
+        control_id="0,0",
+        capability_id="button.momentary",
+        event_type="down",
+        value={"eventType": "down"},
+    )
+
+
+def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCommandMessage:
+    return hw_messages.control_command_for_capability(
+        controller_id=controller_id,
+        ref=CapabilityRef(
+            deviceRef=DeviceRef(managerId="elgato-main", deviceId="deck"),
+            controlId="0,0",
+            capabilityId="raster.bitmap",
+        ),
+        command_type="set_frame",
+        params={
+            "commandType": "set_frame",
+            "image": base64.b64encode(image).decode("ascii"),
+            "encoding": "jpeg",
+        },
+    )
+
+
+def _power_command_message(controller_id: str, command_type: str) -> hw_messages.ControlCommandMessage:
+    return hw_messages.control_command_for_capability(
+        controller_id=controller_id,
+        ref=CapabilityRef(
+            deviceRef=DeviceRef(managerId="elgato-main", deviceId="deck"),
+            capabilityId="device.power",
+        ),
+        command_type=command_type,
+        params={"commandType": command_type},
     )
 
 
@@ -146,24 +246,16 @@ async def test_connect_and_disconnect_rewrite_aggregate_inventory() -> None:
     async with _deckr() as deckr:
         manager = _factory(deckr)
         await manager._handle_device_message(
-            hw_messages.hardware_input_message(
-                manager_id="elgato-main",
-                device_id="deck",
-                body=hw_messages.DeviceConnectedMessage(device=_device()),
-            )
+            _available_message()
         )
         entry = await deckr.state().get(hardware_inventory_key("elgato-main"))
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
         assert set(inventory.devices) == {"deck"}
-        assert inventory.devices["deck"].descriptor["id"] == "deck"
+        assert inventory.devices["deck"].descriptor.device_id == "deck"
 
         await manager._handle_device_message(
-            hw_messages.hardware_input_message(
-                manager_id="elgato-main",
-                device_id="deck",
-                body=hw_messages.DeviceDisconnectedMessage(),
-            )
+            _unavailable_message()
         )
         entry = await deckr.state().get(hardware_inventory_key("elgato-main"))
         assert entry is not None
@@ -188,11 +280,7 @@ async def test_inventory_state_unavailable_keeps_local_device_state() -> None:
         )
 
         await manager._handle_device_message(
-            hw_messages.hardware_input_message(
-                manager_id="elgato-main",
-                device_id="deck",
-                body=hw_messages.DeviceConnectedMessage(device=_device()),
-            )
+            _available_message()
         )
 
     assert "deck" in manager._devices
@@ -235,11 +323,7 @@ async def test_claimed_input_is_sent_only_to_claiming_controller() -> None:
 
         async with main.subscribe() as main_stream, other.subscribe() as other_stream:
             await manager._handle_device_message(
-                hw_messages.hardware_input_message(
-                    manager_id="elgato-main",
-                    device_id="deck",
-                    body=hw_messages.KeyDownMessage(key_id="0,0"),
-                )
+                _input_message()
             )
             received = await main_stream.receive()
             with anyio.move_on_after(0.05) as scope:
@@ -289,11 +373,7 @@ async def test_broker_snapshot_claim_delete_resets_device_and_drops_input() -> N
                     await anyio.sleep(0.01)
 
             await manager._handle_device_message(
-                hw_messages.hardware_input_message(
-                    manager_id="elgato-main",
-                    device_id="deck",
-                    body=hw_messages.KeyDownMessage(key_id="0,0"),
-                )
+                _input_message()
             )
             with anyio.move_on_after(0.05) as scope:
                 await main_stream.receive()
@@ -321,11 +401,7 @@ async def test_controller_presence_restore_makes_current_claim_routable() -> Non
         main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
         async with main.subscribe() as main_stream:
             await manager._handle_device_message(
-                hw_messages.hardware_input_message(
-                    manager_id="elgato-main",
-                    device_id="deck",
-                    body=hw_messages.KeyDownMessage(key_id="0,0"),
-                )
+                _input_message()
             )
             received = await main_stream.receive()
 
@@ -382,6 +458,8 @@ async def test_direct_commands_apply_only_from_claiming_controller() -> None:
 
         def __init__(self) -> None:
             self.set_image = AsyncMock()
+            self.sleep_screen = AsyncMock()
+            self.wake_screen = AsyncMock()
             self.clear_key = AsyncMock()
             self.refresh = AsyncMock()
 
@@ -404,40 +482,25 @@ async def test_direct_commands_apply_only_from_claiming_controller() -> None:
                 "elgato-main",
             )
             await manager._route_command(
-                hw_messages.hardware_command_for_control(
-                    controller_id="other",
-                    ref=hw_messages.HardwareControlRef(
-                        manager_id="elgato-main",
-                        device_id="deck",
-                        control_id="0,0",
-                        control_kind="slot",
-                    ),
-                    message_type=hw_messages.SET_IMAGE,
-                    body=hw_messages.SetImageMessage(slot_id="0,0", image=b"wrong"),
-                )
+                _command_message("other", b"wrong")
             )
             await anyio.sleep(0.05)
             device.set_image.assert_not_awaited()
 
             await manager._route_command(
-                hw_messages.hardware_command_for_control(
-                    controller_id="main",
-                    ref=hw_messages.HardwareControlRef(
-                        manager_id="elgato-main",
-                        device_id="deck",
-                        control_id="0,0",
-                        control_kind="slot",
-                    ),
-                    message_type=hw_messages.SET_IMAGE,
-                    body=hw_messages.SetImageMessage(slot_id="0,0", image=b"ok"),
-                )
+                _command_message("main", b"ok")
             )
             with anyio.fail_after(1):
                 while device.set_image.await_count < 1:
                     await anyio.sleep(0.01)
+            await manager._route_command(_power_command_message("main", "wake"))
+            with anyio.fail_after(1):
+                while device.wake_screen.await_count < 1:
+                    await anyio.sleep(0.01)
             tg.cancel_scope.cancel()
 
     device.set_image.assert_awaited_once_with("0,0", b"ok")
+    device.wake_screen.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
