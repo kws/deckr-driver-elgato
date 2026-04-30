@@ -218,9 +218,9 @@ async def _apply_device_commands(
             continue
         if message.capability_id == "device.power":
             if message.command_type == "wake":
-                await device.wake_screen()
+                await device.wake_device()
             elif message.command_type == "sleep":
-                await device.sleep_screen()
+                await device.sleep_device()
             continue
         if message.capability_id != "raster.bitmap" or message.control_id is None:
             continue
@@ -228,6 +228,9 @@ async def _apply_device_commands(
             encoded = message.params.get("image")
             if not isinstance(encoded, str):
                 continue
-            await device.set_image(message.control_id, base64.b64decode(encoded))
+            await device.set_raster_frame(
+                message.control_id,
+                base64.b64decode(encoded),
+            )
         elif message.command_type == "clear":
-            await device.clear_slot(message.control_id)
+            await device.clear_raster(message.control_id)

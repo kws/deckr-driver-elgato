@@ -168,8 +168,8 @@ class ElgatoDockDevice:
         """
         self._device = device
         self._rows, self._cols = device.key_layout()
-        self._slot_to_key_map = self._create_slot_to_key_map()
-        self._key_to_slot_map = {v: k for k, v in self._slot_to_key_map.items()}
+        self._control_to_key_map = self._create_control_to_key_map()
+        self._key_to_control_map = {v: k for k, v in self._control_to_key_map.items()}
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
             ControlInputEvent
         ](max_buffer_size=100)
@@ -218,14 +218,14 @@ class ElgatoDockDevice:
                 )
         return controls
 
-    def _create_slot_to_key_map(self) -> dict[str, int]:
-        """Create mapping from slot_id (e.g., "0,0") to key index."""
+    def _create_control_to_key_map(self) -> dict[str, int]:
+        """Create mapping from control_id (e.g., "0,0") to key index."""
         mapping = {}
         for row in range(self._rows):
             for col in range(self._cols):
-                slot_id = f"{col},{row}"
+                control_id = f"{col},{row}"
                 key_index = row * self._cols + col
-                mapping[slot_id] = key_index
+                mapping[control_id] = key_index
         return mapping
 
     def _get_device_id(self) -> str:
@@ -320,12 +320,12 @@ class ElgatoDockDevice:
             controls=tuple(self._create_controls()),
         )
 
-    async def wake_screen(self) -> None:
+    async def wake_device(self) -> None:
         """Wake the screen."""
         # StreamDeck doesn't have explicit wake command, but we can set brightness
         await self.set_brightness(100)
 
-    async def sleep_screen(self) -> None:
+    async def sleep_device(self) -> None:
         """Sleep the screen."""
         # StreamDeck doesn't have explicit sleep command, but we can set brightness to 0
         await self.set_brightness(0)
@@ -355,28 +355,28 @@ class ElgatoDockDevice:
         """
         await anyio.to_thread.run_sync(self._device.set_brightness, value)
 
-    async def set_image(self, slot_id: str, image: bytes) -> None:
-        """Set a key image on the private live device.
+    async def set_raster_frame(self, control_id: str, image: bytes) -> None:
+        """Set a raster frame on the private live device.
 
         Args:
-            slot_id: Slot identifier (e.g., "0,0")
+            control_id: Control identifier (e.g., "0,0")
             image: Image bytes
         """
-        await self.set_key_image(slot_id, image)
+        await self.set_key_image(control_id, image)
 
-    async def set_key_image(self, slot_id: str, image: bytes) -> None:
+    async def set_key_image(self, control_id: str, image: bytes) -> None:
         """Set a key image.
 
         Args:
-            slot_id: Slot identifier (e.g., "0,0")
+            control_id: Control identifier (e.g., "0,0")
             image: Image bytes
         """
         if self._disconnected:
             return
 
-        key_index = self._slot_to_key_map.get(slot_id)
+        key_index = self._control_to_key_map.get(control_id)
         if key_index is None:
-            logger.error(f"Slot {slot_id} not found")
+            logger.error(f"Control {control_id} not found")
             return
         try:
             await anyio.to_thread.run_sync(self._device.set_key_image, key_index, image)
@@ -405,18 +405,18 @@ class ElgatoDockDevice:
                 return
             raise
 
-    async def clear_slot(self, slot_id: str) -> None:
-        """Clear a slot on the private live device.
+    async def clear_raster(self, control_id: str) -> None:
+        """Clear raster output on the private live device.
 
         Args:
-            slot_id: Slot identifier (e.g., "0,0")
+            control_id: Control identifier (e.g., "0,0")
         """
         if self._disconnected:
             return
 
-        key_index = self._slot_to_key_map.get(slot_id)
+        key_index = self._control_to_key_map.get(control_id)
         if key_index is None:
-            logger.error(f"Slot {slot_id} not found")
+            logger.error(f"Control {control_id} not found")
             return
         try:
             await anyio.to_thread.run_sync(self._device.set_key_image, key_index, None)
@@ -464,14 +464,14 @@ class ElgatoDockDevice:
     async def _on_key_event(self, device: StreamDeck, key: int, state: bool) -> None:
         """Handle a key event from the StreamDeck device."""
         try:
-            slot_id = self._key_to_slot_map.get(key)
-            if slot_id is None:
-                logger.warning(f"Slot not found for key: {key}")
+            control_id = self._key_to_control_map.get(key)
+            if control_id is None:
+                logger.warning(f"Control not found for key: {key}")
                 return
 
             if state:
                 event = ControlInputEvent(
-                    control_id=slot_id,
+                    control_id=control_id,
                     capability_id="button.momentary",
                     event_type="down",
                     value={"eventType": "down"},
@@ -480,7 +480,7 @@ class ElgatoDockDevice:
             else:
                 await self._event_send.send(
                     ControlInputEvent(
-                        control_id=slot_id,
+                        control_id=control_id,
                         capability_id="button.momentary",
                         event_type="up",
                         value={"eventType": "up"},
@@ -488,7 +488,7 @@ class ElgatoDockDevice:
                 )
                 await self._event_send.send(
                     ControlInputEvent(
-                        control_id=slot_id,
+                        control_id=control_id,
                         capability_id="button.press",
                         event_type="press",
                         value={"eventType": "press"},

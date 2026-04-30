@@ -457,9 +457,10 @@ async def test_direct_commands_apply_only_from_claiming_controller() -> None:
         id = "deck"
 
         def __init__(self) -> None:
-            self.set_image = AsyncMock()
-            self.sleep_screen = AsyncMock()
-            self.wake_screen = AsyncMock()
+            self.set_raster_frame = AsyncMock()
+            self.clear_raster = AsyncMock()
+            self.sleep_device = AsyncMock()
+            self.wake_device = AsyncMock()
             self.clear_key = AsyncMock()
             self.refresh = AsyncMock()
 
@@ -485,22 +486,22 @@ async def test_direct_commands_apply_only_from_claiming_controller() -> None:
                 _command_message("other", b"wrong")
             )
             await anyio.sleep(0.05)
-            device.set_image.assert_not_awaited()
+            device.set_raster_frame.assert_not_awaited()
 
             await manager._route_command(
                 _command_message("main", b"ok")
             )
             with anyio.fail_after(1):
-                while device.set_image.await_count < 1:
+                while device.set_raster_frame.await_count < 1:
                     await anyio.sleep(0.01)
             await manager._route_command(_power_command_message("main", "wake"))
             with anyio.fail_after(1):
-                while device.wake_screen.await_count < 1:
+                while device.wake_device.await_count < 1:
                     await anyio.sleep(0.01)
             tg.cancel_scope.cancel()
 
-    device.set_image.assert_awaited_once_with("0,0", b"ok")
-    device.wake_screen.assert_awaited_once_with()
+    device.set_raster_frame.assert_awaited_once_with("0,0", b"ok")
+    device.wake_device.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
