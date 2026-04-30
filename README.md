@@ -1,6 +1,6 @@
 # deckr-driver-elgato
 
-Elgato Stream Deck driver package for Deckr.
+Elgato Stream Deck hardware manager package for Deckr.
 
 This repo publishes the `deckr-driver-elgato` distribution while keeping the runtime
 module surface under `deckr.drivers.elgato`.

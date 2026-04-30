@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "deckr-driver-elgato"
 version = "0.1.1.dev0"
-description = "Deckr Elgato Stream Deck driver"
+description = "Deckr Elgato Stream Deck hardware manager"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
