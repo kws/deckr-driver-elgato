@@ -12,10 +12,10 @@ from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
     CapabilityDescriptor,
-    CapabilityRef,
     CapabilitySchema,
     ControlDescriptor,
     ControlGeometry,
+    DescriptorCapabilityRef,
     DeviceConnection,
     DeviceDescriptor,
     DeviceIdentifier,
@@ -312,7 +312,7 @@ class ElgatoDockDevice:
             serialNumber=serial,
             identifiers=tuple(identifiers),
             connections=tuple(connections),
-            defaultStatusIndicator=CapabilityRef(
+            defaultStatusIndicator=DescriptorCapabilityRef(
                 controlId="0,0",
                 capabilityId="raster.bitmap",
             ),
