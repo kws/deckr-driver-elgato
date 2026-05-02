@@ -26,6 +26,7 @@ DeviceCommand = DeckrMessage | ResetDeviceCommand
 async def discover_elgato_devices(
     *,
     manager_id: str,
+    sender_session_id: str,
     command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] | None = None,
 ):
     """
@@ -57,6 +58,7 @@ async def discover_elgato_devices(
             send_stream,
             device_connected,
             manager_id,
+            sender_session_id,
             command_streams,
         )
         yield receive_stream
@@ -87,6 +89,7 @@ async def launcher_loop(
     send_stream: anyio.abc.ObjectSendStream[Any],
     device_connected: list[bool],
     manager_id: str,
+    sender_session_id: str,
     command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
 ):
     """Launch devices as they are discovered."""
@@ -98,6 +101,7 @@ async def launcher_loop(
                 send_stream,
                 device_connected,
                 manager_id,
+                sender_session_id,
                 command_streams,
             )
 
@@ -107,6 +111,7 @@ async def device_loop(
     send_stream: anyio.abc.ObjectSendStream[Any],
     device_connected: list[bool],
     manager_id: str,
+    sender_session_id: str,
     command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
 ):
     """Handle a single device's lifecycle."""
@@ -129,6 +134,7 @@ async def device_loop(
             await send_stream.send(
                 hw_messages.device_available_message(
                     manager_id=manager_id,
+                    sender_session_id=sender_session_id,
                     descriptor=my_device.descriptor,
                 )
             )
@@ -142,6 +148,7 @@ async def device_loop(
                             my_device,
                             send_stream,
                             manager_id,
+                            sender_session_id,
                         )
                         tg.start_soon(
                             _run_until_complete,
@@ -167,6 +174,7 @@ async def device_loop(
             await send_stream.send(
                 hw_messages.device_unavailable_message(
                     manager_id=manager_id,
+                    sender_session_id=sender_session_id,
                     device_id=device_id,
                     reason="disconnected",
                 )
@@ -177,11 +185,13 @@ async def _forward_device_events(
     device: Any,
     send_stream: anyio.abc.ObjectSendStream[Any],
     manager_id: str,
+    sender_session_id: str,
 ) -> None:
     async for event in device.subscribe():
         await send_stream.send(
             hw_messages.control_input_message(
                 manager_id=manager_id,
+                sender_session_id=sender_session_id,
                 device_id=device.id,
                 fingerprint=device.hid,
                 control_id=event.control_id,

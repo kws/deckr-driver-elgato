@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -8,6 +10,7 @@ import anyio
 import pytest
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
 from deckr.contracts.messages import (
+    EndpointAddress,
     controller_address,
     hardware_manager_address,
 )
@@ -22,6 +25,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
+from deckr.lanes import RegisteredEndpointLane
 from deckr.runtime import Deckr
 from deckr.state import (
     DeviceClaim,
@@ -35,6 +39,84 @@ from memory_lane_substrate import MemoryLaneSubstrate
 
 from deckr.drivers.elgato._discovery import _apply_device_commands, discover_loop
 from deckr.drivers.elgato._factory import ElgatoDeviceFactory, driver_factory
+
+MANAGER_SESSION = "manager-session"
+CONTROLLER_SESSION = "controller-session"
+
+
+class EndpointHarness:
+    def __init__(
+        self,
+        deckr: Deckr,
+        endpoint: EndpointAddress,
+        *,
+        session_id: str,
+    ) -> None:
+        self._state = deckr.state()
+        self._registered = RegisteredEndpointLane(
+            lane=deckr.lane("hardware_messages"),
+            endpoint=endpoint,
+            session_id=session_id,
+            state=self._state,
+            metadata={"runtime": "test"},
+        )
+        self._presence_revision: int | None = None
+
+    @property
+    def lane(self):
+        return self._registered.lane
+
+    @property
+    def endpoint(self) -> EndpointAddress:
+        return self._registered.endpoint
+
+    @property
+    def session_id(self) -> str:
+        return self._registered.session_id
+
+    async def _ensure_presence(self) -> None:
+        entry = await self._state.put(
+            presence_endpoint_key(lane=self.lane.name, endpoint=self.endpoint),
+            EndpointPresence(
+                endpoint=self.endpoint,
+                lane=self.lane.name,
+                sessionId=self.session_id,
+                timestamp=datetime.now(UTC),
+                ttlSeconds=15,
+            ),
+            ttl=15,
+        )
+        self._presence_revision = entry.revision
+
+    async def publish(self, message):
+        await self._ensure_presence()
+        return await self._registered.publish(message)
+
+    @asynccontextmanager
+    async def subscribe(self) -> AsyncIterator:
+        await self._ensure_presence()
+        async with self._registered.subscribe() as stream:
+            yield stream
+
+    async def __aenter__(self) -> EndpointHarness:
+        await self._ensure_presence()
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        key = presence_endpoint_key(lane=self.lane.name, endpoint=self.endpoint)
+        revision = self._presence_revision
+        if revision is not None:
+            await self._state.delete(key, revision=revision)
+        self._presence_revision = None
+
+
+def _endpoint(
+    deckr: Deckr,
+    endpoint: EndpointAddress,
+    *,
+    session_id: str = CONTROLLER_SESSION,
+) -> EndpointHarness:
+    return EndpointHarness(deckr, endpoint, session_id=session_id)
 
 
 class _FakeDeviceManager:
@@ -107,6 +189,7 @@ def _device() -> DeviceDescriptor:
 def _available_message() -> hw_messages.DeviceAvailableMessage:
     return hw_messages.device_available_message(
         manager_id="elgato-main",
+        sender_session_id=MANAGER_SESSION,
         descriptor=_device(),
     )
 
@@ -114,6 +197,7 @@ def _available_message() -> hw_messages.DeviceAvailableMessage:
 def _unavailable_message() -> hw_messages.DeviceUnavailableMessage:
     return hw_messages.device_unavailable_message(
         manager_id="elgato-main",
+        sender_session_id=MANAGER_SESSION,
         device_id="deck",
         reason="test",
     )
@@ -122,6 +206,7 @@ def _unavailable_message() -> hw_messages.DeviceUnavailableMessage:
 def _input_message() -> hw_messages.ControlInputMessage:
     return hw_messages.control_input_message(
         manager_id="elgato-main",
+        sender_session_id=MANAGER_SESSION,
         device_id="deck",
         control_id="0,0",
         capability_id="button.momentary",
@@ -133,6 +218,7 @@ def _input_message() -> hw_messages.ControlInputMessage:
 def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCommandMessage:
     return hw_messages.control_command_for_capability(
         controller_id=controller_id,
+        sender_session_id=CONTROLLER_SESSION,
         ref=CapabilityRef(
             deviceRef=DeviceRef(managerId="elgato-main", deviceId="deck"),
             controlId="0,0",
@@ -150,6 +236,7 @@ def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCom
 def _power_command_message(controller_id: str, command_type: str) -> hw_messages.ControlCommandMessage:
     return hw_messages.control_command_for_capability(
         controller_id=controller_id,
+        sender_session_id=CONTROLLER_SESSION,
         ref=CapabilityRef(
             deviceRef=DeviceRef(managerId="elgato-main", deviceId="deck"),
             capabilityId="device.power",
@@ -165,9 +252,13 @@ def _factory(deckr: Deckr) -> ElgatoDeviceFactory:
         deckr.state(),
         manager_id="elgato-main",
     )
-    manager._endpoint = deckr.lane("hardware_messages").endpoint(
-        hardware_manager_address("elgato-main")
+    manager._endpoint = _endpoint(
+        deckr,
+        hardware_manager_address("elgato-main"),
+        session_id=MANAGER_SESSION,
     )
+    manager._endpoint_cm = manager._endpoint
+    manager._session_id = manager._endpoint.session_id
     return manager
 
 
@@ -275,8 +366,10 @@ async def test_inventory_state_unavailable_keeps_local_device_state() -> None:
             UnavailableState(),
             manager_id="elgato-main",
         )
-        manager._endpoint = deckr.lane("hardware_messages").endpoint(
-            hardware_manager_address("elgato-main")
+        manager._endpoint = _endpoint(
+            deckr,
+            hardware_manager_address("elgato-main"),
+            session_id=MANAGER_SESSION,
         )
 
         await manager._handle_device_message(
@@ -288,22 +381,14 @@ async def test_inventory_state_unavailable_keeps_local_device_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_presence_heartbeat_refreshes_aggregate_inventory() -> None:
+async def test_inventory_publish_writes_aggregate_inventory() -> None:
     async with _deckr() as deckr:
         manager = _factory(deckr)
         manager._devices["deck"] = _device()
 
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(manager._presence_loop)
-            with anyio.fail_after(1):
-                while True:
-                    entry = await deckr.state().get(
-                        hardware_inventory_key("elgato-main")
-                    )
-                    if entry is not None:
-                        break
-                    await anyio.sleep(0.01)
-            tg.cancel_scope.cancel()
+        await manager._publish_inventory_safely()
+        entry = await deckr.state().get(hardware_inventory_key("elgato-main"))
+        assert entry is not None
 
     inventory = HardwareInventory.model_validate(entry.value)
     assert set(inventory.devices) == {"deck"}
@@ -318,8 +403,8 @@ async def test_claimed_input_is_sent_only_to_claiming_controller() -> None:
         manager._controller_presence_sessions[controller_address("main")] = (
             "controller-session"
         )
-        main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
-        other = deckr.lane("hardware_messages").endpoint(controller_address("other"))
+        main = _endpoint(deckr, controller_address("main"))
+        other = _endpoint(deckr, controller_address("other"))
 
         async with main.subscribe() as main_stream, other.subscribe() as other_stream:
             await manager._handle_device_message(
@@ -352,7 +437,7 @@ async def test_broker_snapshot_claim_delete_resets_device_and_drops_input() -> N
         claim_key = "claim.device.elgato-main.deck"
         await deckr.state().create(claim_key, _claim())
         await manager._reconcile_routing_current_state(reason="test snapshot")
-        main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
+        main = _endpoint(deckr, controller_address("main"))
 
         async with (
             command_send,
@@ -398,7 +483,7 @@ async def test_controller_presence_restore_makes_current_claim_routable() -> Non
         await manager._reconcile_routing_current_state(reason="test snapshot")
         assert manager._claim_recipient("deck") == controller_address("main")
 
-        main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
+        main = _endpoint(deckr, controller_address("main"))
         async with main.subscribe() as main_stream:
             await manager._handle_device_message(
                 _input_message()
@@ -509,21 +594,7 @@ async def test_graceful_stop_revision_deletes_presence_and_inventory() -> None:
     async with _deckr() as deckr:
         manager = _factory(deckr)
         manager._devices["deck"] = _device()
-        presence_entry = await deckr.state().put(
-            presence_endpoint_key(
-                lane="hardware_messages",
-                endpoint=hardware_manager_address("elgato-main"),
-            ),
-            EndpointPresence(
-                endpoint=hardware_manager_address("elgato-main"),
-                lane="hardware_messages",
-                sessionId=manager._session_id,
-                timestamp=datetime.now(UTC),
-                ttlSeconds=15,
-                metadata={},
-            ),
-        )
-        manager._presence_revision = presence_entry.revision
+        await manager._endpoint._ensure_presence()
         await manager._publish_inventory()
 
         assert (
