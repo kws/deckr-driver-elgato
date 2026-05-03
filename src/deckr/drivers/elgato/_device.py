@@ -8,7 +8,6 @@ from typing import Any
 
 import anyio
 from deckr.hardware.capabilities import (
-    button_activation_value_schema,
     button_momentary_value_schema,
     device_power_command_schema,
     raster_bitmap_command_schema,
@@ -48,25 +47,6 @@ def _momentary_button_capability() -> CapabilityDescriptor:
         access=("emits",),
         valueSchema=button_momentary_value_schema(),
         eventTypes=("down", "up"),
-    )
-
-
-def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
-    return CapabilityDescriptor(
-        capabilityId="button.press",
-        family=DECKR_INPUT_BUTTON,
-        type="activation",
-        direction="input",
-        access=("emits",),
-        valueSchema=button_activation_value_schema(),
-        eventTypes=("press",),
-        projection={
-            "owner": "hardware_manager",
-            "source": {
-                "controlId": control_id,
-                "capabilityId": "button.momentary",
-            },
-        },
     )
 
 
@@ -168,10 +148,7 @@ class ElgatoDockDevice:
                             height=1,
                             unit="grid",
                         ),
-                        inputCapabilities=(
-                            _momentary_button_capability(),
-                            _activation_button_capability(control_id),
-                        ),
+                        inputCapabilities=(_momentary_button_capability(),),
                         outputCapabilities=(
                             _raster_capability(width, height, rotation),
                         ),
@@ -453,14 +430,6 @@ class ElgatoDockDevice:
                         capability_id="button.momentary",
                         event_type="up",
                         value={"eventType": "up"},
-                    )
-                )
-                await self._event_send.send(
-                    ControlInputEvent(
-                        control_id=control_id,
-                        capability_id="button.press",
-                        event_type="press",
-                        value={"eventType": "press"},
                     )
                 )
 

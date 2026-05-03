@@ -37,6 +37,7 @@ from deckr.state import (
 )
 from memory_lane_substrate import MemoryLaneSubstrate
 
+from deckr.drivers.elgato._device import ElgatoDockDevice
 from deckr.drivers.elgato._discovery import _apply_device_commands, discover_loop
 from deckr.drivers.elgato._factory import ElgatoDeviceFactory, driver_factory
 
@@ -127,6 +128,11 @@ class _FakeDeviceManager:
         return self._devices
 
 
+class _FakeStreamDeck:
+    def key_layout(self) -> tuple[int, int]:
+        return 1, 1
+
+
 def _deckr() -> Deckr:
     lane_contracts = LaneContractRegistry(CORE_LANE_CONTRACTS.values())
     return Deckr(
@@ -148,14 +154,6 @@ def _control() -> ControlDescriptor:
                 direction="input",
                 access=("emits",),
                 eventTypes=("down", "up"),
-            ),
-            CapabilityDescriptor(
-                capabilityId="button.press",
-                family=DECKR_INPUT_BUTTON,
-                type="activation",
-                direction="input",
-                access=("emits",),
-                eventTypes=("press",),
             ),
         ),
         outputCapabilities=(
@@ -288,6 +286,34 @@ async def _put_controller_presence(
             metadata={},
         ),
     )
+
+
+def test_elgato_descriptor_exposes_only_momentary_button_input() -> None:
+    device = ElgatoDockDevice(_FakeStreamDeck())
+
+    controls = device._create_controls()
+
+    assert len(controls) == 1
+    assert [
+        (capability.capability_id, capability.event_types)
+        for capability in controls[0].input_capabilities
+    ] == [("button.momentary", ("down", "up"))]
+
+
+@pytest.mark.asyncio
+async def test_elgato_key_up_emits_only_momentary_up() -> None:
+    device = ElgatoDockDevice(_FakeStreamDeck())
+
+    await device._on_key_event(object(), 0, False)
+
+    with anyio.fail_after(1):
+        event = await device._event_receive.receive()
+    assert event.control_id == "0,0"
+    assert event.capability_id == "button.momentary"
+    assert event.event_type == "up"
+    with anyio.move_on_after(0.05) as scope:
+        await device._event_receive.receive()
+    assert scope.cancel_called is True
 
 
 def test_driver_factory_returns_elgato_device_factory() -> None:
