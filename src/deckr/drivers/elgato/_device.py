@@ -7,12 +7,17 @@ from dataclasses import dataclass
 from typing import Any
 
 import anyio
+from deckr.hardware.capabilities import (
+    button_activation_value_schema,
+    button_momentary_value_schema,
+    device_power_command_schema,
+    raster_bitmap_command_schema,
+)
 from deckr.hardware.descriptors import (
     DECKR_DEVICE_POWER,
     DECKR_INPUT_BUTTON,
     DECKR_OUTPUT_RASTER,
     CapabilityDescriptor,
-    CapabilitySchema,
     ControlDescriptor,
     ControlGeometry,
     DescriptorCapabilityRef,
@@ -34,40 +39,6 @@ class ControlInputEvent:
     value: dict[str, Any]
 
 
-def _button_value_schema(events: tuple[str, ...], schema_id: str) -> CapabilitySchema:
-    return CapabilitySchema.model_validate(
-        {
-            "schemaId": schema_id,
-            "schema": {
-                "type": "object",
-                "required": ["eventType"],
-                "properties": {"eventType": {"enum": list(events)}},
-                "additionalProperties": False,
-            },
-        }
-    )
-
-
-def _raster_command_schema(width: int, height: int) -> CapabilitySchema:
-    return CapabilitySchema.model_validate(
-        {
-            "schemaId": "deckr.command.output.raster.bitmap.v1",
-            "schema": {
-                "type": "object",
-                "required": ["commandType"],
-                "properties": {
-                    "commandType": {"enum": ["set_frame", "clear"]},
-                    "image": {"type": "string", "contentEncoding": "base64"},
-                    "encoding": {"enum": ["jpeg", "png"]},
-                    "width": {"const": width},
-                    "height": {"const": height},
-                },
-                "additionalProperties": False,
-            },
-        }
-    )
-
-
 def _momentary_button_capability() -> CapabilityDescriptor:
     return CapabilityDescriptor(
         capabilityId="button.momentary",
@@ -75,10 +46,7 @@ def _momentary_button_capability() -> CapabilityDescriptor:
         type="momentary",
         direction="input",
         access=("emits",),
-        valueSchema=_button_value_schema(
-            ("down", "up"),
-            "deckr.value.input.button.momentary.v1",
-        ),
+        valueSchema=button_momentary_value_schema(),
         eventTypes=("down", "up"),
     )
 
@@ -90,10 +58,7 @@ def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
         type="activation",
         direction="input",
         access=("emits",),
-        valueSchema=_button_value_schema(
-            ("press",),
-            "deckr.value.input.button.activation.v1",
-        ),
+        valueSchema=button_activation_value_schema(),
         eventTypes=("press",),
         projection={
             "owner": "hardware_manager",
@@ -113,7 +78,10 @@ def _raster_capability(width: int, height: int, rotation: int) -> CapabilityDesc
             "type": "bitmap",
             "direction": "output",
             "access": ["settable"],
-            "commandSchema": _raster_command_schema(width, height).model_dump(
+            "commandSchema": raster_bitmap_command_schema(
+                width=width,
+                height=height,
+            ).model_dump(
                 by_alias=True,
                 exclude_none=True,
                 mode="json",
@@ -151,6 +119,7 @@ def _power_capability() -> CapabilityDescriptor:
         type="screen",
         direction="command",
         access=("invokable",),
+        commandSchema=device_power_command_schema(),
         commandTypes=("sleep", "wake"),
     )
 
