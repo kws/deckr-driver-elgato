@@ -23,6 +23,7 @@ from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
+    DEFAULT_STATE_LEASE_TTL_SECONDS,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -45,7 +46,7 @@ from deckr.drivers.elgato._discovery import (
 logger = logging.getLogger(__name__)
 
 INVENTORY_HEARTBEAT_SECONDS = 5.0
-INVENTORY_TTL_SECONDS = 15
+INVENTORY_TTL_SECONDS = DEFAULT_STATE_LEASE_TTL_SECONDS
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _CONTROLLER_PRESENCE_PREFIX = ".".join(
