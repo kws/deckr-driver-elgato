@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.entry-points."deckr.components"]
-"deckr.drivers.elgato" = "deckr.drivers.elgato:component"
+"com.k-si.deckr.hardware.elgato" = "deckr.drivers.elgato:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-driver-elgato#readme"
