@@ -23,7 +23,8 @@ from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import DeviceDescriptor, DeviceRef
 from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
-    DEFAULT_STATE_LEASE_TTL_SECONDS,
+    DEFAULT_DISCOVERY_STATE_STORE_NAME,
+    DEFAULT_LEASE_STATE_STORE_NAME,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -33,8 +34,10 @@ from deckr.state import (
     StateUnavailable,
     encode_key_token,
     hardware_inventory_key,
+    observe_prefix_current,
     parse_device_claim_key,
     parse_presence_endpoint_key,
+    presence_endpoint_key,
 )
 
 from deckr.drivers.elgato._discovery import (
@@ -45,8 +48,6 @@ from deckr.drivers.elgato._discovery import (
 
 logger = logging.getLogger(__name__)
 
-INVENTORY_HEARTBEAT_SECONDS = 5.0
-INVENTORY_TTL_SECONDS = DEFAULT_STATE_LEASE_TTL_SECONDS
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _CONTROLLER_PRESENCE_PREFIX = ".".join(
@@ -61,10 +62,18 @@ _CONTROLLER_PRESENCE_PREFIX = ".".join(
 
 
 class ElgatoDeviceFactory(BaseComponent):
-    def __init__(self, hardware_lane: Lane, state: StateStore, *, manager_id: str):
+    def __init__(
+        self,
+        hardware_lane: Lane,
+        lease_state: StateStore,
+        discovery_state: StateStore,
+        *,
+        manager_id: str,
+    ):
         super().__init__("elgato_device_factory")
         self._hardware_lane = hardware_lane
-        self._state = state
+        self._lease_state = lease_state
+        self._discovery_state = discovery_state
         self.manager_id = manager_id
         self._session_id = ""
         self._cancel_scope: anyio.CancelScope | None = None
@@ -78,6 +87,7 @@ class ElgatoDeviceFactory(BaseComponent):
         self._unroutable_devices: set[str] = set()
         self._command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] = {}
         self._inventory_revision: int | None = None
+        self._inventory_dirty = False
         self._routing_reconcile_lock = anyio.Lock()
 
     async def start(self, ctx: RunContext) -> None:
@@ -91,11 +101,11 @@ class ElgatoDeviceFactory(BaseComponent):
             self._session_id = self._endpoint.session_id
             self._cancel_scope = ctx.tg.cancel_scope
             await self._publish_inventory_safely()
-            ctx.tg.start_soon(self._inventory_refresh_loop)
             ctx.tg.start_soon(self._command_subscription_loop)
             ctx.tg.start_soon(self._claim_watch_loop)
             ctx.tg.start_soon(self._controller_presence_loop)
             ctx.tg.start_soon(self._routing_reconciliation_loop)
+            ctx.tg.start_soon(self._inventory_retry_loop)
             ctx.tg.start_soon(self._discovery_loop)
         except BaseException:
             with anyio.CancelScope(shield=True):
@@ -186,14 +196,13 @@ class ElgatoDeviceFactory(BaseComponent):
     async def _publish_inventory(self) -> None:
         if self._endpoint is None:
             return
-        entry = await self._state.put(
+        entry = await self._discovery_state.put(
             hardware_inventory_key(self.manager_id),
             HardwareInventory(
                 managerId=self.manager_id,
                 managerEndpoint=self._endpoint.endpoint,
                 sessionId=self._session_id,
                 timestamp=datetime.now(UTC),
-                ttlSeconds=INVENTORY_TTL_SECONDS,
                 devices={
                     device_id: HardwareInventoryDevice(
                         deviceRef=DeviceRef(
@@ -206,23 +215,26 @@ class ElgatoDeviceFactory(BaseComponent):
                     for device_id, device in sorted(self._devices.items())
                 },
             ),
-            ttl=INVENTORY_TTL_SECONDS,
         )
         self._inventory_revision = entry.revision
 
     async def _publish_inventory_safely(self) -> None:
         try:
             await self._publish_inventory()
+            self._inventory_dirty = False
         except StateUnavailable:
+            self._inventory_dirty = True
             logger.warning(
-                "Elgato inventory current state is unavailable; heartbeat will retry",
+                "Elgato inventory current state is unavailable; dirty inventory "
+                "publish will retry",
                 exc_info=True,
             )
 
-    async def _inventory_refresh_loop(self) -> None:
+    async def _inventory_retry_loop(self) -> None:
         while True:
-            await anyio.sleep(INVENTORY_HEARTBEAT_SECONDS)
-            await self._publish_inventory_safely()
+            await anyio.sleep(5)
+            if self._inventory_dirty:
+                await self._publish_inventory_safely()
 
     async def _withdraw_inventory(self) -> None:
         revision = self._inventory_revision
@@ -230,7 +242,7 @@ class ElgatoDeviceFactory(BaseComponent):
             return
         with anyio.CancelScope(shield=True):
             try:
-                await self._state.delete(
+                await self._discovery_state.delete(
                     hardware_inventory_key(self.manager_id),
                     revision=revision,
                 )
@@ -244,7 +256,7 @@ class ElgatoDeviceFactory(BaseComponent):
         prefix = f"claim.device.{encode_key_token(self.manager_id)}."
         while True:
             try:
-                async with self._state.watch(prefix) as stream:
+                async with self._lease_state.watch(prefix) as stream:
                     async for change in stream:
                         parsed = parse_device_claim_key(change.key)
                         if parsed is None:
@@ -265,7 +277,9 @@ class ElgatoDeviceFactory(BaseComponent):
     async def _controller_presence_loop(self) -> None:
         while True:
             try:
-                async with self._state.watch(_CONTROLLER_PRESENCE_PREFIX) as stream:
+                async with self._lease_state.watch(
+                    _CONTROLLER_PRESENCE_PREFIX
+                ) as stream:
                     async for change in stream:
                         parsed = parse_presence_endpoint_key(change.key)
                         if parsed is None:
@@ -300,14 +314,37 @@ class ElgatoDeviceFactory(BaseComponent):
 
     async def _reconcile_routing_current_state_locked(self, *, reason: str) -> None:
         claim_prefix = f"claim.device.{encode_key_token(self.manager_id)}."
-        claim_entries = await self._state.items(claim_prefix)
-        presence_entries = await self._state.items(_CONTROLLER_PRESENCE_PREFIX)
+        claim_observation = await observe_prefix_current(
+            self._lease_state,
+            claim_prefix,
+            known_keys=(
+                f"claim.device.{encode_key_token(self.manager_id)}."
+                f"{encode_key_token(device_id)}"
+                for device_id in self._claims
+            ),
+        )
+        presence_observation = await observe_prefix_current(
+            self._lease_state,
+            _CONTROLLER_PRESENCE_PREFIX,
+            known_keys=(
+                presence_endpoint_key(lane="hardware_messages", endpoint=endpoint)
+                for endpoint in self._controller_presence_sessions
+            ),
+        )
 
-        next_claims: dict[str, DeviceClaim] = {}
+        next_claims = dict(self._claims)
         invalid_claim_devices: set[str] = set()
-        next_controller_sessions: dict[EndpointAddress, str] = {}
+        next_controller_sessions = dict(self._controller_presence_sessions)
 
-        for entry in claim_entries:
+        for key in claim_observation.confirmed_missing:
+            parsed = parse_device_claim_key(key)
+            if parsed is None:
+                continue
+            manager_id, device_id = parsed
+            if manager_id == self.manager_id:
+                next_claims.pop(device_id, None)
+
+        for entry in claim_observation.entries:
             parsed = parse_device_claim_key(entry.key)
             if parsed is None:
                 continue
@@ -319,8 +356,17 @@ class ElgatoDeviceFactory(BaseComponent):
             except ValueError:
                 logger.warning("Ignoring invalid Elgato device claim %s", entry.key)
                 invalid_claim_devices.add(device_id)
+                next_claims.pop(device_id, None)
 
-        for entry in presence_entries:
+        for key in presence_observation.confirmed_missing:
+            parsed = parse_presence_endpoint_key(key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane == "hardware_messages" and endpoint.family == "controller":
+                next_controller_sessions.pop(endpoint, None)
+
+        for entry in presence_observation.entries:
             parsed = parse_presence_endpoint_key(entry.key)
             if parsed is None:
                 continue
@@ -467,13 +513,15 @@ def _claim_recipient(
 
 def driver_factory(
     hardware_lane: Lane,
-    state: StateStore,
+    lease_state: StateStore,
+    discovery_state: StateStore,
     *,
     manager_id: str,
 ) -> ElgatoDeviceFactory:
     return ElgatoDeviceFactory(
         hardware_lane=hardware_lane,
-        state=state,
+        lease_state=lease_state,
+        discovery_state=discovery_state,
         manager_id=manager_id,
     )
 
@@ -485,7 +533,8 @@ def component_factory(context: ComponentContext) -> ElgatoDeviceFactory:
         raise ValueError("deckr.drivers.elgato requires manager_id")
     return driver_factory(
         context.require_lane("hardware_messages"),
-        context.state(),
+        context.state(DEFAULT_LEASE_STATE_STORE_NAME),
+        context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
         manager_id=manager_id,
     )
 
