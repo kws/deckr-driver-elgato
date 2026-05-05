@@ -537,7 +537,7 @@ def component_factory(context: ComponentContext) -> ElgatoDeviceFactory:
 
 component = ComponentDefinition(
     manifest=ComponentManifest(
-        component_id="com.k-si.deckr.hardware.elgato",
+        component_id="dev.deckr.hardware.elgato",
         consumes=("hardware_messages",),
         publishes=("hardware_messages",),
         endpoint_slots=("hardware_manager",),
