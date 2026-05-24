@@ -10,6 +10,7 @@ from deckr.beacon import (
     BEACON_ADVERTISEMENT_STORE_POLICY,
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
     BeaconDiscovery,
+    BeaconService,
 )
 from deckr.components import (
     BaseComponent,
@@ -24,6 +25,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
 )
 from deckr.contracts.messages import DeckrMessage, hardware_manager_address
 from deckr.hardware.runtime import HardwareManagerRuntime
@@ -60,8 +62,8 @@ class ElgatoDeviceFactory(BaseComponent):
     def __init__(
         self,
         hardware_lane: Lane,
-        beacon: BeaconDiscovery,
-        concord: ConcordCoordinator,
+        beacon: BeaconService,
+        concord: ConcordService,
         *,
         manager_id: str,
         labels: Mapping[str, str] | None = None,
@@ -170,8 +172,8 @@ class ElgatoDeviceFactory(BaseComponent):
 
 def driver_factory(
     hardware_lane: Lane,
-    beacon: BeaconDiscovery,
-    concord: ConcordCoordinator,
+    beacon: BeaconService,
+    concord: ConcordService,
     *,
     manager_id: str,
     labels: Mapping[str, str] | None = None,
@@ -188,21 +190,25 @@ def driver_factory(
 def component_factory(context: ComponentContext) -> ElgatoDeviceFactory:
     return driver_factory(
         context.require_lane("hardware_messages"),
-        BeaconDiscovery(
-            context.state(
-                DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-                policy=BEACON_ADVERTISEMENT_STORE_POLICY,
+        BeaconService(
+            BeaconDiscovery(
+                context.state(
+                    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+                    policy=BEACON_ADVERTISEMENT_STORE_POLICY,
+                )
             )
         ),
-        ConcordCoordinator(
-            context.state(
-                DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-                policy=CONCORD_CONTRACT_STORE_POLICY,
-            ),
-            context.state(
-                DEFAULT_CONCORD_TOKEN_STORE_NAME,
-                policy=CONCORD_TOKEN_STORE_POLICY,
-            ),
+        ConcordService(
+            ConcordCoordinator(
+                context.state(
+                    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
+                    policy=CONCORD_CONTRACT_STORE_POLICY,
+                ),
+                context.state(
+                    DEFAULT_CONCORD_TOKEN_STORE_NAME,
+                    policy=CONCORD_TOKEN_STORE_POLICY,
+                ),
+            )
         ),
         manager_id=context.require_endpoint_id("hardware_manager"),
         labels=_labels_from_config(context.config),
