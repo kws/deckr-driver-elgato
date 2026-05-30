@@ -102,13 +102,10 @@ class FakeDiscovery:
 async def _claim(factory, concord: ConcordService, controller_endpoint):
     runtime = factory._runtime
     assert runtime is not None
-    advertisement = runtime.advertisement
-    assert advertisement is not None
     terms = HardwareClaimTerms(
         claimId="claim-1",
         controllerEndpoint=controller_endpoint.endpoint,
         managerEndpoint=hardware_manager_address("elgato-main"),
-        managerAdvertisementId=advertisement.advertisement_id,
         devices=(
             HardwareClaimDevice(
                 deviceRef=DeviceRef(
