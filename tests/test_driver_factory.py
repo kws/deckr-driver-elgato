@@ -117,14 +117,14 @@ async def _claim(factory, concord: ConcordService, controller_endpoint):
             ),
         ),
     )
-    contract = await concord.create_contract(
+    contract = await concord._create_contract(
         (controller_endpoint.endpoint, hardware_manager_address("elgato-main")),
         contract_id="claim-1",
         profile=HARDWARE_CLAIM_PROFILE_ID,
         terms=terms,
         created_by=controller_endpoint.endpoint,
     )
-    await concord.attach(
+    await concord._attach(
         contract,
         controller_endpoint.endpoint,
         controller_endpoint.session_id,
@@ -173,7 +173,7 @@ async def test_elgato_advertises_hardware_and_routes_claimed_input(monkeypatch):
             assert payload.devices["deck"].descriptor == _device()
 
             contract = await _claim(factory, _concord(deckr), controller_endpoint)
-            assert (await _concord(deckr).validate(contract)).status == (
+            assert (await _concord(deckr)._validate(contract)).status == (
                 ContractValidityStatus.VALID
             )
 
@@ -247,7 +247,7 @@ async def test_elgato_authorized_commands_and_claim_loss_reset(monkeypatch):
             with anyio.fail_after(1):
                 assert await command_receive.receive() == command
 
-            await concord.cancel(contract, controller_endpoint.endpoint, reason="test")
+            await concord._cancel(contract, controller_endpoint.endpoint, reason="test")
             await runtime.reconcile_claims(reason="test cancel")
             with anyio.fail_after(1):
                 assert isinstance(await command_receive.receive(), ResetDeviceCommand)
