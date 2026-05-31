@@ -9,9 +9,10 @@ module surface under `deckr.drivers.elgato`.
 
 The component registers `hardware_manager:<manager-id>` on the
 `hardware_messages` lane. Device discovery and USB command execution are local
-to this package, while Beacon advertisement, Concord hardware-claim
+to this package, while Beacon candidate advertisement, Concord hardware-claim
 participation, token refresh, and command/input routing are handled by
-`deckr.hardware.runtime.HardwareManagerRuntime`.
+`deckr.hardware.runtime.HardwareManagerRuntime`. After a claim is negotiated,
+claim authority is Concord-only.
 
 The manager no longer publishes legacy discovery inventory or lease-state claim
 records. Controllers claim devices through `dev.deckr.profile.hardware_claim.v1`
