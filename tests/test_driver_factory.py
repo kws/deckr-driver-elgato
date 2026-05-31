@@ -35,7 +35,7 @@ from deckr.runtime import Deckr
 from memory_lane_substrate import MemoryLaneSubstrate
 
 from deckr.drivers.elgato import _factory as factory_module
-from deckr.drivers.elgato._discovery import ResetDeviceCommand
+from deckr.drivers.elgato._discovery import DeviceConnected, ResetDeviceCommand
 
 pytestmark = pytest.mark.asyncio
 
@@ -153,13 +153,7 @@ async def test_elgato_advertises_hardware_and_routes_claimed_input(monkeypatch):
             await factory.start(RunContext(tg=tg, stopping=anyio.Event()))
             runtime = factory._runtime
             assert runtime is not None
-            await fake_discovery.send.send(
-                hw_messages.device_available_message(
-                    manager_id="elgato-main",
-                    sender_session_id=runtime.endpoint.session_id,
-                    descriptor=_device(),
-                )
-            )
+            await fake_discovery.send.send(DeviceConnected(_device()))
             with anyio.fail_after(1):
                 while "deck" not in runtime.devices:
                     await anyio.sleep(0.01)
@@ -221,13 +215,7 @@ async def test_elgato_authorized_commands_and_claim_loss_reset(monkeypatch):
             await factory.start(RunContext(tg=tg, stopping=anyio.Event()))
             runtime = factory._runtime
             assert runtime is not None
-            await fake_discovery.send.send(
-                hw_messages.device_available_message(
-                    manager_id="elgato-main",
-                    sender_session_id=runtime.endpoint.session_id,
-                    descriptor=_device(),
-                )
-            )
+            await fake_discovery.send.send(DeviceConnected(_device()))
             with anyio.fail_after(1):
                 while "deck" not in runtime.devices:
                     await anyio.sleep(0.01)

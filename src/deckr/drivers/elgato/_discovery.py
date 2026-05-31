@@ -14,6 +14,7 @@ from deckr.hardware.capabilities import (
     device_power_command_params,
     raster_bitmap_command_params,
 )
+from deckr.hardware.descriptors import DeviceDescriptor
 from pydantic import ValidationError
 from StreamDeck.DeviceManager import DeviceManager
 
@@ -27,7 +28,19 @@ class ResetDeviceCommand:
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceConnected:
+    descriptor: DeviceDescriptor
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceDisconnected:
+    device_id: str
+    reason: str
+
+
 DeviceCommand = DeckrMessage | ResetDeviceCommand
+DeviceDiscoveryEvent = DeckrMessage | DeviceConnected | DeviceDisconnected
 
 
 @asynccontextmanager
@@ -139,13 +152,7 @@ async def device_loop(
             command_streams[device_id] = command_send
 
             logger.info("Device connected: %s", device_id)
-            await send_stream.send(
-                hw_messages.device_available_message(
-                    manager_id=manager_id,
-                    sender_session_id=sender_session_id,
-                    descriptor=my_device.descriptor,
-                )
-            )
+            await send_stream.send(DeviceConnected(my_device.descriptor))
             async with command_send, command_receive:
                 try:
                     async with anyio.create_task_group() as tg:
@@ -179,14 +186,7 @@ async def device_loop(
         # Signal device disconnected
         device_connected[0] = False
         if device_id is not None:
-            await send_stream.send(
-                hw_messages.device_unavailable_message(
-                    manager_id=manager_id,
-                    sender_session_id=sender_session_id,
-                    device_id=device_id,
-                    reason="disconnected",
-                )
-            )
+            await send_stream.send(DeviceDisconnected(device_id, "disconnected"))
 
 
 async def _forward_device_events(
