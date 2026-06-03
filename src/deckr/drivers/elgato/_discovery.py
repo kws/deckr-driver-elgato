@@ -1,264 +1,231 @@
-import base64
-import binascii
+"""Elgato Stream Deck discovery and device supervision."""
+
+from __future__ import annotations
+
+import hashlib
 import logging
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 import anyio
 from deckr.contracts.messages import DeckrMessage
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.capabilities import (
-    RasterBitmapClearParams,
-    RasterBitmapSetFrameParams,
-    device_power_command_params,
-    raster_bitmap_command_params,
-)
-from deckr.hardware.descriptors import DeviceDescriptor
-from pydantic import ValidationError
+from deckr.hardware.runtime import HardwareManagerRuntime
 from StreamDeck.DeviceManager import DeviceManager
+from StreamDeck.Devices.StreamDeck import StreamDeck
 
-from deckr.drivers.elgato._device import launch_device
+from deckr.drivers.elgato._device import ElgatoDockDevice, launch_device
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True, slots=True)
-class ResetDeviceCommand:
-    pass
+DeviceManagerFactory = Callable[[], DeviceManager]
 
 
-@dataclass(frozen=True, slots=True)
-class DeviceConnected:
-    descriptor: DeviceDescriptor
+class ElgatoDeviceSupervisor:
+    """Poll, open, and supervise all attached Elgato Stream Deck devices."""
 
+    def __init__(
+        self,
+        *,
+        runtime: HardwareManagerRuntime,
+        manager_id: str,
+        device_manager_factory: DeviceManagerFactory = DeviceManager,
+        poll_interval: float = 1.0,
+    ) -> None:
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be greater than zero")
+        self._runtime = runtime
+        self._manager_id = manager_id
+        self._device_manager_factory = device_manager_factory
+        self._poll_interval = poll_interval
+        self._active_by_device_id: dict[str, ElgatoDockDevice] = {}
+        self._active_by_token: dict[str, str] = {}
+        self._active_fingerprints: set[str] = set()
+        self._pending_tokens: set[str] = set()
+        self._lock = anyio.Lock()
+        self._stopping = anyio.Event()
+        self._task_group: anyio.abc.TaskGroup | None = None
 
-@dataclass(frozen=True, slots=True)
-class DeviceDisconnected:
-    device_id: str
-    reason: str
+    @property
+    def devices(self) -> dict[str, ElgatoDockDevice]:
+        return dict(self._active_by_device_id)
 
+    def start(self, task_group: anyio.abc.TaskGroup) -> None:
+        self._task_group = task_group
+        task_group.start_soon(self._poll_loop)
 
-DeviceCommand = DeckrMessage | ResetDeviceCommand
-DeviceDiscoveryEvent = DeckrMessage | DeviceConnected | DeviceDisconnected
+    async def stop(self) -> None:
+        self._stopping.set()
+        async with self._lock:
+            devices = tuple(self._active_by_device_id.values())
+        for device in devices:
+            await device.mark_disconnected()
 
+    async def handle_command(self, envelope: DeckrMessage) -> bool | None:
+        ref = hw_messages.hardware_device_ref_from_message(envelope)
+        if ref is None or ref.manager_id != self._manager_id:
+            return None
+        body = hw_messages.hardware_body_from_message(envelope)
+        if not isinstance(body, hw_messages.ControlCommandMessage):
+            return None
+        async with self._lock:
+            device = self._active_by_device_id.get(ref.device_id)
+        if device is None:
+            logger.debug(
+                "Dropping command for closed Elgato device %s/%s",
+                ref.manager_id,
+                ref.device_id,
+            )
+            return False
+        return await device.handle_command(envelope, manager_id=self._manager_id)
 
-@asynccontextmanager
-async def discover_elgato_devices(
-    *,
-    manager_id: str,
-    sender_session_id: str,
-    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] | None = None,
-):
-    """
-    The discovery loop manages StreamDeck device connections. It discovers the first
-    available device and opens it. If the device disconnects, it will be re-discovered
-    and re-opened.
+    async def reset_device(self, device_id: str) -> None:
+        async with self._lock:
+            device = self._active_by_device_id.get(device_id)
+        if device is not None:
+            await device.reset_outputs()
 
-    Only one device can be connected at a time. When a device is successfully opened,
-    a connection event is sent to the event stream. When the device disconnects, a
-    disconnected event is sent.
-    """
-    send_stream, receive_stream = anyio.create_memory_object_stream[Any](
-        max_buffer_size=100
-    )
-    discovery_send, discovery_receive = anyio.create_memory_object_stream[Any](
-        max_buffer_size=100
-    )
-    if command_streams is None:
-        command_streams = {}
+    async def _poll_loop(self) -> None:
+        device_manager = self._device_manager_factory()
+        while not self._stopping.is_set():
+            try:
+                devices = await anyio.to_thread.run_sync(
+                    lambda: list(device_manager.enumerate())
+                )
+            except Exception:
+                logger.warning("Could not enumerate Elgato devices", exc_info=True)
+                await anyio.sleep(self._poll_interval)
+                continue
 
-    # Track if a device is currently connected (using a list to allow mutation from nested functions)
-    device_connected = [False]
+            for device in devices:
+                token = _raw_device_token(device)
+                if await self._should_launch(token):
+                    task_group = self._task_group
+                    if task_group is not None:
+                        task_group.start_soon(self._device_loop, device, token)
+            await anyio.sleep(self._poll_interval)
 
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(discover_loop, discovery_send, device_connected)
-        tg.start_soon(
-            launcher_loop,
-            discovery_receive,
-            send_stream,
-            device_connected,
-            manager_id,
-            sender_session_id,
-            command_streams,
-        )
-        yield receive_stream
+    async def _should_launch(self, token: str) -> bool:
+        async with self._lock:
+            if token in self._pending_tokens or token in self._active_by_token:
+                return False
+            self._pending_tokens.add(token)
+            return True
 
-
-async def discover_loop(
-    send_stream: anyio.abc.ObjectSendStream[Any],
-    device_connected: list[bool],
-):
-    """Poll for StreamDeck devices and send the first one if no device is connected."""
-    device_manager = DeviceManager()
-
-    while True:
+    async def _device_loop(self, raw_device: StreamDeck, token: str) -> None:
+        device_id: str | None = None
         try:
-            devices = list(device_manager.enumerate())
+            async with launch_device(raw_device) as device:
+                if device is None:
+                    return
+                device_id = device.id
+                if not await self._register_device(token, device):
+                    return
+                await self._runtime.set_device(device.descriptor)
+                logger.info("Elgato device connected: %s", device.id)
+                await self._run_open_device(device)
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:
+            logger.warning("Elgato device task failed", exc_info=True)
+        finally:
+            await self._unregister_device(token, device_id)
 
-            # Only send a device if we don't have one connected
-            if not device_connected[0] and len(devices) > 0:
-                await send_stream.send(devices[0])
-        except Exception as e:
-            logger.error(f"Error in discovery loop: {e}", exc_info=True)
+    async def _register_device(self, token: str, device: ElgatoDockDevice) -> bool:
+        async with self._lock:
+            self._pending_tokens.discard(token)
+            if device.fingerprint in self._active_fingerprints:
+                logger.debug("Ignoring duplicate Elgato device %s", device.fingerprint)
+                return False
+            self._active_by_token[token] = device.id
+            self._active_by_device_id[device.id] = device
+            self._active_fingerprints.add(device.fingerprint)
+            return True
 
-        await anyio.sleep(1)
+    async def _unregister_device(self, token: str, device_id: str | None) -> None:
+        removed = False
+        async with self._lock:
+            self._pending_tokens.discard(token)
+            mapped_device_id = self._active_by_token.pop(token, None)
+            device_id = device_id or mapped_device_id
+            device = (
+                self._active_by_device_id.pop(device_id, None)
+                if device_id is not None
+                else None
+            )
+            if device is not None:
+                self._active_fingerprints.discard(device.fingerprint)
+                removed = True
+        if removed and device_id is not None:
+            await self._runtime.remove_device(device_id, reason="disconnected")
+            logger.info("Elgato device disconnected: %s", device_id)
 
-
-async def launcher_loop(
-    receive_stream: anyio.abc.ObjectReceiveStream[Any],
-    send_stream: anyio.abc.ObjectSendStream[Any],
-    device_connected: list[bool],
-    manager_id: str,
-    sender_session_id: str,
-    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
-):
-    """Launch devices as they are discovered."""
-    async with anyio.create_task_group() as tg:
-        async for device in receive_stream:
+    async def _run_open_device(self, device: ElgatoDockDevice) -> None:
+        async with anyio.create_task_group() as tg:
             tg.start_soon(
-                device_loop,
+                _run_until_complete,
+                tg.cancel_scope,
+                self._forward_input,
                 device,
-                send_stream,
-                device_connected,
-                manager_id,
-                sender_session_id,
-                command_streams,
+            )
+            tg.start_soon(
+                _run_until_complete,
+                tg.cancel_scope,
+                self._monitor_connection,
+                device,
             )
 
-
-async def device_loop(
-    device: Any,
-    send_stream: anyio.abc.ObjectSendStream[Any],
-    device_connected: list[bool],
-    manager_id: str,
-    sender_session_id: str,
-    command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]],
-):
-    """Handle a single device's lifecycle."""
-    cancelled = anyio.get_cancelled_exc_class()
-    device_id = None
-
-    try:
-        async with launch_device(device) as my_device:
-            if my_device is None:
-                return
-
-            device_id = my_device.id
-            device_connected[0] = True  # Signal device is connected
-            command_send, command_receive = anyio.create_memory_object_stream[
-                DeviceCommand
-            ](max_buffer_size=100)
-            command_streams[device_id] = command_send
-
-            logger.info("Device connected: %s", device_id)
-            await send_stream.send(DeviceConnected(my_device.descriptor))
-            async with command_send, command_receive:
-                try:
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(
-                            _run_until_complete,
-                            tg.cancel_scope,
-                            _forward_device_events,
-                            my_device,
-                            send_stream,
-                            manager_id,
-                            sender_session_id,
-                        )
-                        tg.start_soon(
-                            _run_until_complete,
-                            tg.cancel_scope,
-                            _apply_device_commands,
-                            my_device,
-                            command_receive,
-                            manager_id,
-                        )
-                finally:
-                    command_streams.pop(device_id, None)
-
-    except cancelled as e:
-        raise e
-    except Exception as e:
-        logger.info("Device error: %s", e)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.exception("Device error: %s", e, exc_info=True)
-    finally:
-        # Signal device disconnected
-        device_connected[0] = False
-        if device_id is not None:
-            await send_stream.send(DeviceDisconnected(device_id, "disconnected"))
-
-
-async def _forward_device_events(
-    device: Any,
-    send_stream: anyio.abc.ObjectSendStream[Any],
-    manager_id: str,
-    sender_session_id: str,
-) -> None:
-    async for event in device.subscribe():
-        await send_stream.send(
-            hw_messages.control_input_message(
-                manager_id=manager_id,
-                sender_session_id=sender_session_id,
-                device_id=device.id,
-                fingerprint=device.hid,
-                control_id=event.control_id,
-                capability_id=event.capability_id,
-                event_type=event.event_type,
-                value=event.value,
+    async def _forward_input(self, device: ElgatoDockDevice) -> None:
+        async for event in device.subscribe():
+            await self._runtime.handle_hardware_message(
+                hw_messages.control_input_message(
+                    manager_id=self._manager_id,
+                    sender_session_id=self._runtime.endpoint.session_id,
+                    device_id=device.id,
+                    fingerprint=device.fingerprint,
+                    control_id=event.control_id,
+                    capability_id=event.capability_id,
+                    event_type=event.event_type,
+                    value=event.value,
+                    sources=event.sources,
+                )
             )
-        )
+
+    async def _monitor_connection(self, device: ElgatoDockDevice) -> None:
+        while not self._stopping.is_set() and device.is_connected():
+            await anyio.sleep(self._poll_interval)
+        await device.mark_disconnected()
 
 
-async def _run_until_complete(cancel_scope, func, *args) -> None:
+async def _run_until_complete(cancel_scope: anyio.CancelScope, func, *args) -> None:
     try:
         await func(*args)
     finally:
         cancel_scope.cancel()
 
 
-async def _apply_device_commands(
-    device: Any,
-    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
-    manager_id: str,
-) -> None:
-    async for command in command_stream:
-        if isinstance(command, ResetDeviceCommand):
-            await device.clear_key()
-            await device.refresh()
-            continue
-        envelope = command
-        ref = hw_messages.hardware_device_ref_from_message(envelope)
-        if ref is None or ref.manager_id != manager_id or ref.device_id != device.id:
-            continue
-        message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.ControlCommandMessage):
-            continue
-        if message.capability_id == "device.power":
-            try:
-                device_power_command_params(message.params)
-            except ValidationError as exc:
-                logger.warning("Ignoring invalid power command params: %s", exc)
-                continue
-            if message.command_type == "wake":
-                await device.wake_device()
-            elif message.command_type == "sleep":
-                await device.sleep_device()
-            continue
-        if message.capability_id != "raster.bitmap" or message.control_id is None:
-            continue
+def _raw_device_token(device: Any) -> str:
+    transport = getattr(device, "device", None)
+    path = getattr(transport, "path", None)
+    if path is not None:
         try:
-            params = raster_bitmap_command_params(message.command_type, message.params)
-        except (ValueError, ValidationError) as exc:
-            logger.warning("Ignoring invalid raster command params: %s", exc)
-            continue
-        if isinstance(params, RasterBitmapSetFrameParams):
-            try:
-                await device.set_raster_frame(
-                    message.control_id,
-                    base64.b64decode(params.image, validate=True),
-                )
-            except (ValueError, binascii.Error) as exc:
-                logger.warning("Ignoring invalid raster image payload: %s", exc)
-        elif isinstance(params, RasterBitmapClearParams):
-            await device.clear_raster(message.control_id)
+            value = path()
+        except Exception:
+            value = None
+        if value is not None:
+            return f"path:{value}"
+    vendor = _safe_call(device, "vendor_id")
+    product = _safe_call(device, "product_id")
+    if vendor is not None and product is not None:
+        return f"usb:{vendor}:{product}:{id(device)}"
+    return "object:" + hashlib.sha256(str(id(device)).encode()).hexdigest()[:16]
+
+
+def _safe_call(device: Any, method_name: str) -> Any:
+    method = getattr(device, method_name, None)
+    if method is None:
+        return None
+    try:
+        return method()
+    except Exception:
+        return None

@@ -1,4 +1,5 @@
-from ._device import ElgatoDockDevice
-from ._factory import component, driver_factory
+"""Elgato Stream Deck hardware manager component."""
 
-__all__ = ["ElgatoDockDevice", "component", "driver_factory"]
+from ._factory import component
+
+__all__ = ["component"]
