@@ -274,7 +274,9 @@ async def _claim(
     device_id: str | None = None,
 ):
     descriptor = (
-        runtime.devices[device_id] if device_id is not None else next(iter(runtime.devices.values()))
+        runtime._devices[device_id]
+        if device_id is not None
+        else next(iter(runtime._devices.values()))
     )
     terms = HardwareClaimTerms(
         claimId="claim-1",
@@ -303,7 +305,7 @@ async def _claim(
         controller_endpoint.address,
         controller_endpoint.session_id,
     )
-    await runtime.reconcile_claims(reason="test")
+    await runtime._reconcile_claims(reason="test")
     return contract
 
 
@@ -464,7 +466,7 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
             async with anyio.create_task_group() as tg:
                 supervisor.start(tg)
                 with anyio.fail_after(2):
-                    while len(runtime.devices) != 2:
+                    while len(supervisor.devices) != 2:
                         await anyio.sleep(0.01)
 
                 payload = await _wait_for_hardware_payload(
