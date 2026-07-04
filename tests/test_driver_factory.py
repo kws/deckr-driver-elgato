@@ -475,6 +475,24 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                 )
                 assert sorted(payload.devices) == ["A123", "B123"]
 
+                unauthorized = hw_messages.control_command_message(
+                    controller_id="controller-main",
+                    sender_session_id=controller_endpoint.session_id,
+                    manager_id="manager-main",
+                    device_id="A123",
+                    control_id="key.0.0",
+                    capability_id="raster.bitmap",
+                    command_type="clear",
+                    recipient_session_id=runtime.endpoint.session_id,
+                    contract={"contractId": "unauthorized-claim", "generation": 1},
+                )
+                deckr._message_bus.publish_reply.reset_mock()  # noqa: SLF001
+                assert not await runtime._handle_command(unauthorized)  # noqa: SLF001
+                rejected = deckr._message_bus.publish_reply.call_args.args[0]  # noqa: SLF001
+                rejection = hw_messages.hardware_body_from_message(rejected)
+                assert isinstance(rejection, hw_messages.CommandRejectedMessage)
+                assert rejection.reason == "unauthorized"
+
                 contract = await _claim(
                     runtime,
                     deckr,
@@ -494,6 +512,19 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                 routed = deckr._message_bus.publish.call_args.args[0]  # noqa: SLF001
                 assert routed.recipient.endpoint == controller_endpoint.address
                 assert routed.recipient_session_id == controller_endpoint.session_id
+                body = hw_messages.hardware_body_from_message(routed)
+                assert isinstance(body, hw_messages.ControlInputMessage)
+                assert body.control_id == "key.0.0"
+                assert body.capability_id == "button.momentary"
+                assert body.event_type == "down"
+
+                raw_a.close()
+                with anyio.fail_after(2):
+                    while (await deckr.concord._validate(contract)).status != (  # noqa: SLF001
+                        ContractValidityStatus.CANCELLED
+                    ):
+                        await anyio.sleep(0.01)
+                assert runtime.live_claims == ()
 
                 await supervisor.stop()
                 tg.cancel_scope.cancel()
