@@ -299,13 +299,26 @@ async def _claim(
         profile=HARDWARE_CLAIM_PROFILE_ID,
         terms=terms,
         created_by=controller_endpoint.address,
+        participant_sessions={
+            str(runtime.endpoint.address): runtime.endpoint.session_id,
+        },
     )
     await deckr.concord._attach(
         contract,
         controller_endpoint.address,
         controller_endpoint.session_id,
     )
-    await runtime._reconcile_claims(reason="test")
+    await runtime._claim_manager.notify_policy_changed()
+    with anyio.fail_after(2):
+        while (
+            (await deckr.concord._validate(contract)).status
+            != ContractValidityStatus.VALID
+            or not any(
+                claim.contract.pointer == contract.pointer
+                for claim in runtime.live_claims
+            )
+        ):
+            await anyio.sleep(0)
     return contract
 
 
@@ -451,12 +464,11 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
         manager_endpoint = await manager_cm.__aenter__()
         controller_endpoint = await controller_cm.__aenter__()
         try:
-            runtime = HardwareManagerRuntime(
-                endpoint=manager_endpoint,
-                beacon=deckr.beacon,
-                concord=deckr.concord,
+            runtime_context = deckr.hardware_manager(
+                manager_endpoint,
                 manager_id="manager-main",
             )
+            runtime = await runtime_context.__aenter__()
             supervisor = ElgatoDeviceSupervisor(
                 runtime=runtime,
                 manager_id="manager-main",
@@ -529,5 +541,7 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                 await supervisor.stop()
                 tg.cancel_scope.cancel()
         finally:
+            if "runtime_context" in locals():
+                await runtime_context.__aexit__(None, None, None)
             await manager_cm.__aexit__(None, None, None)
             await controller_cm.__aexit__(None, None, None)

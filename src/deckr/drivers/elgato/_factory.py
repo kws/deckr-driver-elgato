@@ -51,40 +51,34 @@ class ElgatoHardwareComponent(BaseComponent):
         supervisor = self._supervisor
         if supervisor is not None:
             await supervisor.stop()
-        runtime = self._runtime
-        if runtime is not None:
-            await runtime.stop()
 
     async def _run(self, ctx: RunContext) -> None:
         async with self._context.open_endpoint(
             "hardware_manager",
             metadata={"runtime": "deckr-driver-elgato-python"},
         ) as endpoint:
-            runtime = HardwareManagerRuntime(
-                endpoint=endpoint,
-                beacon=self._context.require_beacon(),
-                concord=self._context.require_concord(),
+            manager = self._context.hardware_manager(
+                endpoint,
                 manager_id=endpoint.address.endpoint_id,
                 labels=_labels_from_config(self._context.config),
             )
-            supervisor = ElgatoDeviceSupervisor(
-                runtime=runtime,
-                manager_id=endpoint.address.endpoint_id,
-            )
-            runtime.command_handler = supervisor.handle_command
-            runtime.reset_handler = supervisor.reset_device
-            self._runtime = runtime
-            self._supervisor = supervisor
-            try:
-                await runtime.start(ctx.tg)
-                supervisor.start(ctx.tg)
-                await ctx.report_ready()
-                await ctx.stopping.wait()
-            finally:
-                await supervisor.stop()
-                await runtime.stop()
-                self._runtime = None
-                self._supervisor = None
+            async with manager as runtime:
+                supervisor = ElgatoDeviceSupervisor(
+                    runtime=runtime,
+                    manager_id=endpoint.address.endpoint_id,
+                )
+                runtime.command_handler = supervisor.handle_command
+                runtime.reset_handler = supervisor.reset_device
+                self._runtime = runtime
+                self._supervisor = supervisor
+                try:
+                    supervisor.start(ctx.tg)
+                    await ctx.report_ready()
+                    await ctx.stopping.wait()
+                finally:
+                    await supervisor.stop()
+                    self._runtime = None
+                    self._supervisor = None
 
 
 def component_factory(context: ComponentContext) -> ElgatoHardwareComponent:
