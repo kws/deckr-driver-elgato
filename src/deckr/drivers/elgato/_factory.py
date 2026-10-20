@@ -12,7 +12,7 @@ from deckr.components import (
     ComponentManifest,
     RunContext,
 )
-from deckr.hardware.runtime import HardwareManagerRuntime
+from deckr.hardware import HardwareManagerRuntime
 
 from deckr.drivers.elgato._discovery import ElgatoDeviceSupervisor
 

@@ -9,8 +9,8 @@ from typing import Any
 
 import anyio
 from deckr.contracts.messages import DeckrMessage
+from deckr.hardware import HardwareManagerRuntime
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.runtime import HardwareManagerRuntime
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.Devices.StreamDeck import StreamDeck
 
