@@ -113,23 +113,31 @@ class ElgatoDeviceSupervisor:
             return True
 
     async def _device_loop(self, raw_device: StreamDeck, token: str) -> None:
-        device_id: str | None = None
         try:
             async with launch_device(raw_device) as device:
                 if device is None:
                     return
-                device_id = device.id
                 if not await self._register_device(token, device):
                     return
-                await self._runtime.set_device(device.descriptor)
-                logger.info("Elgato device connected: %s", device.id)
-                await self._run_open_device(device)
+                try:
+                    await self._runtime.set_device(device.descriptor)
+                    logger.info("Elgato device connected: %s", device.id)
+                    await self._run_open_device(device)
+                finally:
+                    # A rejected duplicate shares the physical display but does
+                    # not own it. Only reset an interface we registered.
+                    try:
+                        await anyio.to_thread.run_sync(raw_device.reset)
+                    except Exception:
+                        logger.debug(
+                            "Could not reset Elgato device during close", exc_info=True
+                        )
         except anyio.get_cancelled_exc_class():
             raise
         except Exception:
             logger.warning("Elgato device task failed", exc_info=True)
         finally:
-            await self._unregister_device(token, device_id)
+            await self._unregister_device(token)
 
     async def _register_device(self, token: str, device: ElgatoDockDevice) -> bool:
         async with self._lock:
@@ -142,12 +150,13 @@ class ElgatoDeviceSupervisor:
             self._active_fingerprints.add(device.fingerprint)
             return True
 
-    async def _unregister_device(self, token: str, device_id: str | None) -> None:
+    async def _unregister_device(self, token: str) -> None:
         removed = False
         async with self._lock:
             self._pending_tokens.discard(token)
-            mapped_device_id = self._active_by_token.pop(token, None)
-            device_id = device_id or mapped_device_id
+            # Only the interface that registered the device owns its cleanup.
+            # A rejected duplicate can have the same device ID as a live owner.
+            device_id = self._active_by_token.pop(token, None)
             device = (
                 self._active_by_device_id.pop(device_id, None)
                 if device_id is not None

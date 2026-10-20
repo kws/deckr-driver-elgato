@@ -25,6 +25,10 @@ surfaces, then forwards claimed hardware input through the runtime. Raster
 bitmap commands are converted with `StreamDeck.ImageHelpers.PILHelper`, so
 Pillow is a direct runtime dependency.
 
+Duplicate USB interfaces are ignored without resetting the display, removing the
+active device, or cancelling its claim. Only the registered interface owns device
+cleanup.
+
 ## Development
 
 The `deckr` Python distribution now comes from the sibling

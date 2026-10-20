@@ -981,10 +981,6 @@ async def launch_device(device: StreamDeck) -> AsyncIterator[ElgatoDockDevice | 
         except Exception:
             logger.debug("Could not clear Elgato callbacks", exc_info=True)
         try:
-            await anyio.to_thread.run_sync(device.reset)
-        except Exception:
-            logger.debug("Could not reset Elgato device during close", exc_info=True)
-        try:
             await anyio.to_thread.run_sync(device.close)
         except Exception:
             logger.debug("Could not close Elgato device", exc_info=True)

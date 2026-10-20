@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,7 @@ from deckr.hardware import (
 )
 from message_bus_mocks import mock_deckr
 from PIL import Image
+from StreamDeck.Devices.StreamDeck import DialEventType, TouchscreenEventType
 
 from deckr.drivers.elgato import _factory as factory_module
 from deckr.drivers.elgato._device import ElgatoDockDevice
@@ -311,12 +313,9 @@ async def _claim(
     await runtime._claim_manager.notify_policy_changed()
     with anyio.fail_after(2):
         while (
-            (await deckr.concord._validate(contract)).status
-            != ContractValidityStatus.VALID
-            or not any(
-                claim.contract.pointer == contract.pointer
-                for claim in runtime.live_claims
-            )
+            await deckr.concord._validate(contract)
+        ).status != ContractValidityStatus.VALID or not any(
+            claim.contract.pointer == contract.pointer for claim in runtime.live_claims
         ):
             await anyio.sleep(0)
     return contract
@@ -350,13 +349,21 @@ async def test_component_uses_hosted_context_and_managed_protocols(monkeypatch):
     monkeypatch.setattr(factory_module, "ElgatoDeviceSupervisor", FakeSupervisor)
     plan = resolve_component_host_plan(
         _component_document(),
-        definitions={"dev.deckr.hardware.elgato": factory_module.component},
+        definitions={
+            entry.name: entry.load()
+            for entry in entry_points(
+                group="deckr.components", name="dev.deckr.hardware.elgato"
+            )
+        },
     )
 
-    async with mock_deckr(
-        lane_contracts=plan.lane_contracts,
-        lanes=plan.lane_names,
-    ) as deckr, start_components(deckr, plan) as component_host:
+    async with (
+        mock_deckr(
+            lane_contracts=plan.lane_contracts,
+            lanes=plan.lane_names,
+        ) as deckr,
+        start_components(deckr, plan) as component_host,
+    ):
         await _wait_for_readiness(
             component_host.component_manager,
             "dev.deckr.hardware.elgato:main",
@@ -420,7 +427,11 @@ async def test_device_executes_raster_and_power_commands():
         params={"image": _png_payload(), "encoding": "png"},
     )
     assert await device.handle_command(set_frame, manager_id="manager-main")
-    assert raw.key_images[0]
+    with Image.open(io.BytesIO(raw.key_images[0])) as rendered:
+        assert rendered.format == "JPEG"
+        assert rendered.size == (80, 80)
+        red, green, blue = rendered.convert("RGB").getpixel((40, 40))
+        assert red > 250 and green < 5 and blue < 5
 
     clear = hw_messages.control_command_message(
         controller_id="controller-main",
@@ -455,6 +466,141 @@ async def test_device_executes_raster_and_power_commands():
     assert raw.brightness_values == [0, 100]
 
 
+@pytest.mark.parametrize(
+    ("manager_id", "device_id", "control_id", "image"),
+    [
+        ("other-manager", "MINI123", "key.0.0", _png_payload()),
+        ("manager-main", "other-device", "key.0.0", _png_payload()),
+        ("manager-main", "MINI123", "missing", _png_payload()),
+        ("manager-main", "MINI123", "key.0.0", "invalid base64!"),
+        ("manager-main", "MINI123", "key.0.0", "bm90IGFuIGltYWdl"),
+    ],
+)
+async def test_invalid_or_misdirected_raster_commands_do_not_write_hardware(
+    manager_id, device_id, control_id, image
+):
+    raw = _FakeStreamDeck(serial="MINI123", path="usb-mini")
+    device = ElgatoDockDevice(raw)
+    raw.open()
+    command = hw_messages.control_command_message(
+        controller_id="controller-main",
+        sender_session_id="controller-session",
+        manager_id=manager_id,
+        device_id=device_id,
+        control_id=control_id,
+        capability_id="raster.bitmap",
+        command_type="set_frame",
+        params={"image": image, "encoding": "png"},
+    )
+
+    assert await device.handle_command(command, manager_id="manager-main") is None
+    assert raw.key_images == {}
+    assert raw.brightness_values == []
+
+
+async def test_dial_and_touch_callbacks_deliver_values_and_ignore_invalid_input():
+    raw = _FakeStreamDeck(
+        serial="PLUS123",
+        path="usb-plus",
+        dial_count=1,
+        touch=True,
+        touchscreen_size=(800, 100),
+    )
+    device = ElgatoDockDevice(raw)
+    # Build the descriptor as discovery does, including the touchscreen surface.
+    _ = device.descriptor
+    await device._on_dial_event(raw, 0, DialEventType.TURN, -2)
+    await device._on_dial_event(raw, 0, DialEventType.TURN, 3)
+    await device._on_dial_event(raw, 0, DialEventType.PUSH, True)
+    await device._on_dial_event(raw, 0, DialEventType.PUSH, False)
+    await device._on_dial_event(raw, 0, DialEventType.TURN, 0)
+    await device._on_dial_event(raw, 99, DialEventType.TURN, 1)
+    await device._on_touchscreen_event(raw, TouchscreenEventType.SHORT, {"x": 10})
+    await device._on_touchscreen_event(
+        raw, TouchscreenEventType.DRAG, {"x": 70, "x_out": 20}
+    )
+    await device._on_touchscreen_event(
+        raw, TouchscreenEventType.DRAG, {"x": 20, "x_out": 70}
+    )
+    await device._on_touchscreen_event(
+        raw, TouchscreenEventType.DRAG, {"x": 20, "x_out": 20}
+    )
+    await device.mark_disconnected()
+    events = [event async for event in device.subscribe()]
+
+    assert [
+        (event.control_id, event.capability_id, event.event_type, event.value)
+        for event in events
+    ] == [
+        (
+            "dial.0",
+            "encoder.relative",
+            "rotate",
+            {"delta": -2, "direction": "counterclockwise"},
+        ),
+        (
+            "dial.0",
+            "encoder.relative",
+            "rotate",
+            {"delta": 3, "direction": "clockwise"},
+        ),
+        ("dial.0", "button.momentary", "down", {"eventType": "down"}),
+        ("dial.0", "button.momentary", "up", {"eventType": "up"}),
+        ("touchscreen.0", "touch.gesture", "tap", {"eventType": "tap"}),
+        (
+            "touchscreen.0",
+            "touch.gesture",
+            "swipe",
+            {"eventType": "swipe", "direction": "left"},
+        ),
+        (
+            "touchscreen.0",
+            "touch.gesture",
+            "swipe",
+            {"eventType": "swipe", "direction": "right"},
+        ),
+    ]
+
+
+async def test_duplicate_interface_cleanup_preserves_active_device_and_claim():
+    primary = _FakeStreamDeck(serial="A123", path="usb-primary")
+    duplicate = _FakeStreamDeck(serial="A123", path="usb-duplicate")
+    primary.open()
+    device = ElgatoDockDevice(primary)
+    async with (
+        mock_deckr() as deckr,
+        deckr.endpoint(hardware_manager_address("manager-main")) as manager,
+        deckr.endpoint(controller_address("controller-main")) as controller,
+        deckr.hardware_manager(manager, manager_id="manager-main") as runtime,
+    ):
+        supervisor = ElgatoDeviceSupervisor(runtime=runtime, manager_id="manager-main")
+        assert await supervisor._register_device("primary", device)
+        await runtime.set_device(device.descriptor)
+        contract = await _claim(runtime, deckr, controller)
+
+        with anyio.fail_after(2):
+            await supervisor._device_loop(duplicate, "duplicate")
+
+        assert duplicate.closed
+        assert duplicate.reset_count == 0
+        assert supervisor.devices == {"A123": device}
+        assert primary.is_open()
+        assert (await deckr.concord._validate(contract)).status == (
+            ContractValidityStatus.VALID
+        )
+        payload = await _wait_for_hardware_payload(deckr, device_ids={"A123"})
+        assert payload.devices["A123"].descriptor == device.descriptor
+
+        # The owning interface must still remove the device and its authority.
+        await supervisor._unregister_device("primary")
+        assert supervisor.devices == {}
+        assert (await deckr.concord._validate(contract)).status == (
+            ContractValidityStatus.CANCELLED
+        )
+    await device.mark_disconnected()
+    primary.close()
+
+
 async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
     raw_a = _FakeStreamDeck(serial="A123", path="usb-a")
     raw_b = _FakeStreamDeck(serial="B123", path="usb-b")
@@ -467,6 +613,8 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
             runtime_context = deckr.hardware_manager(
                 manager_endpoint,
                 manager_id="manager-main",
+                command_handler=lambda envelope: supervisor.handle_command(envelope),
+                reset_handler=lambda device_id: supervisor.reset_device(device_id),
             )
             runtime = await runtime_context.__aenter__()
             supervisor = ElgatoDeviceSupervisor(
@@ -514,6 +662,23 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                 assert (await deckr.concord._validate(contract)).status == (
                     ContractValidityStatus.VALID
                 )
+                command = hw_messages.control_command_message(
+                    controller_id="controller-main",
+                    sender_session_id=controller_endpoint.session_id,
+                    manager_id="manager-main",
+                    device_id="A123",
+                    control_id="key.0.0",
+                    capability_id="raster.bitmap",
+                    command_type="set_frame",
+                    params={"image": _png_payload(), "encoding": "png"},
+                    recipient_session_id=runtime.endpoint.session_id,
+                    contract=contract.pointer,
+                )
+                assert await runtime._handle_command(command)
+                with Image.open(io.BytesIO(raw_a.key_images[0])) as rendered:
+                    assert rendered.size == (80, 80)
+                    assert rendered.convert("RGB").getpixel((40, 40))[0] > 250
+                assert raw_b.key_images == {}
                 deckr._message_bus.publish.reset_mock()  # noqa: SLF001
 
                 active = supervisor.devices["A123"]
@@ -537,6 +702,7 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                     ):
                         await anyio.sleep(0.01)
                 assert runtime.live_claims == ()
+                assert raw_a.reset_count == 1
 
                 await supervisor.stop()
                 tg.cancel_scope.cancel()
