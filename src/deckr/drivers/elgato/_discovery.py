@@ -8,8 +8,7 @@ from collections.abc import Callable
 from typing import Any
 
 import anyio
-from deckr.contracts.messages import DeckrMessage
-from deckr.hardware import HardwareManagerRuntime
+from deckr.hardware import HardwareCommandContext, HardwareManagerRuntime
 from deckr.hardware import messages as hw_messages
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.Devices.StreamDeck import StreamDeck
@@ -61,7 +60,9 @@ class ElgatoDeviceSupervisor:
         for device in devices:
             await device.mark_disconnected()
 
-    async def handle_command(self, envelope: DeckrMessage) -> bool | None:
+    async def handle_command(self, context: HardwareCommandContext) -> bool | None:
+        context.authorize()
+        envelope = context.message
         ref = hw_messages.hardware_device_ref_from_message(envelope)
         if ref is None or ref.manager_id != self._manager_id:
             return None
@@ -77,7 +78,7 @@ class ElgatoDeviceSupervisor:
                 ref.device_id,
             )
             return False
-        return await device.handle_command(envelope, manager_id=self._manager_id)
+        return await device.handle_command(context, manager_id=self._manager_id)
 
     async def reset_device(self, device_id: str) -> None:
         async with self._lock:

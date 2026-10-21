@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import anyio
-from deckr.contracts.messages import DeckrMessage
+from deckr.hardware import HardwareCommandContext
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.capabilities import (
     RasterBitmapClearParams,
@@ -317,9 +317,10 @@ class ElgatoDockDevice:
                     f"usb:path:{hashlib.sha256(path.encode()).hexdigest()[:16]}"
                 )
             else:
-                self._fingerprint = "usb:unknown:" + hashlib.sha256(
-                    str(id(self._device)).encode()
-                ).hexdigest()[:16]
+                self._fingerprint = (
+                    "usb:unknown:"
+                    + hashlib.sha256(str(id(self._device)).encode()).hexdigest()[:16]
+                )
         return self._fingerprint
 
     @property
@@ -359,12 +360,14 @@ class ElgatoDockDevice:
 
     async def handle_command(
         self,
-        envelope: DeckrMessage,
+        context: HardwareCommandContext,
         *,
         manager_id: str,
     ) -> bool | None:
         if self._disconnected:
             return False
+        context.authorize()
+        envelope = context.message
         ref = hw_messages.hardware_device_ref_from_message(envelope)
         if ref is None or ref.manager_id != manager_id or ref.device_id != self.id:
             return None
@@ -372,9 +375,9 @@ class ElgatoDockDevice:
         if not isinstance(body, hw_messages.ControlCommandMessage):
             return None
         if body.capability_id == "device.power":
-            return await self._handle_power_command(body)
+            return await self._handle_power_command(body, context)
         if body.capability_id == "raster.bitmap":
-            return await self._handle_raster_command(body)
+            return await self._handle_raster_command(body, context)
         return None
 
     async def reset_outputs(self) -> None:
@@ -384,6 +387,7 @@ class ElgatoDockDevice:
     async def _handle_power_command(
         self,
         body: hw_messages.ControlCommandMessage,
+        context: HardwareCommandContext,
     ) -> bool | None:
         try:
             device_power_command_params(body.params)
@@ -391,16 +395,19 @@ class ElgatoDockDevice:
             logger.warning("Ignoring invalid Elgato power command params: %s", exc)
             return None
         if body.command_type == "wake":
-            await self._run_device_call(self._device.set_brightness, 100)
+            await self._run_device_call(
+                self._device.set_brightness, 100, context=context
+            )
             return True
         if body.command_type == "sleep":
-            await self._run_device_call(self._device.set_brightness, 0)
+            await self._run_device_call(self._device.set_brightness, 0, context=context)
             return True
         return None
 
     async def _handle_raster_command(
         self,
         body: hw_messages.ControlCommandMessage,
+        context: HardwareCommandContext,
     ) -> bool | None:
         if body.control_id is None:
             return None
@@ -413,7 +420,7 @@ class ElgatoDockDevice:
             logger.warning("Ignoring invalid Elgato raster command params: %s", exc)
             return None
         if isinstance(params, RasterBitmapClearParams):
-            await self._clear_raster(body.control_id)
+            await self._clear_raster(body.control_id, context=context)
             return True
         if isinstance(params, RasterBitmapSetFrameParams):
             try:
@@ -421,11 +428,13 @@ class ElgatoDockDevice:
             except (ValueError, binascii.Error, UnidentifiedImageError) as exc:
                 logger.warning("Ignoring invalid Elgato raster image payload: %s", exc)
                 return None
-            await self._set_raster(body.control_id, image)
+            await self._set_raster(body.control_id, image, context)
             return True
         return None
 
-    async def _set_raster(self, control_id: str, image: Image.Image) -> None:
+    async def _set_raster(
+        self, control_id: str, image: Image.Image, context: HardwareCommandContext
+    ) -> None:
         surface = self._raster_surfaces[control_id]
         image = _fit_rgb_canvas(image, (surface.width, surface.height))
         if surface.kind == "key":
@@ -434,11 +443,14 @@ class ElgatoDockDevice:
                 self._device.set_key_image,
                 surface.key_index,
                 native,
+                context=context,
             )
             return
         if surface.kind == "screen":
             native = PILHelper.to_native_screen_format(self._device, image)
-            await self._run_device_call(self._device.set_screen_image, native)
+            await self._run_device_call(
+                self._device.set_screen_image, native, context=context
+            )
             return
         native = PILHelper.to_native_touchscreen_format(self._device, image)
         await self._run_device_call(
@@ -448,9 +460,12 @@ class ElgatoDockDevice:
             0,
             surface.width,
             surface.height,
+            context=context,
         )
 
-    async def _clear_raster(self, control_id: str) -> None:
+    async def _clear_raster(
+        self, control_id: str, *, context: HardwareCommandContext | None = None
+    ) -> None:
         if self._disconnected:
             return
         surface = self._raster_surfaces.get(control_id)
@@ -461,16 +476,25 @@ class ElgatoDockDevice:
                 self._device.set_key_image,
                 surface.key_index,
                 None,
+                context=context,
             )
         elif surface.kind == "screen":
-            await self._run_device_call(self._device.set_screen_image, None)
+            await self._run_device_call(
+                self._device.set_screen_image, None, context=context
+            )
         else:
-            await self._run_device_call(self._device.set_touchscreen_image, None)
+            await self._run_device_call(
+                self._device.set_touchscreen_image, None, context=context
+            )
 
-    async def _run_device_call(self, func, *args) -> Any:
+    async def _run_device_call(
+        self, func, *args, context: HardwareCommandContext | None = None
+    ) -> Any:
         if self._disconnected:
             return None
         try:
+            if context is not None:
+                return await context.run_sync(func, *args)
             return await anyio.to_thread.run_sync(func, *args)
         except Exception as exc:
             if _looks_like_disconnect(exc):
@@ -533,9 +557,7 @@ class ElgatoDockDevice:
                     event_type="rotate",
                     value={
                         "delta": delta,
-                        "direction": (
-                            "clockwise" if delta > 0 else "counterclockwise"
-                        ),
+                        "direction": ("clockwise" if delta > 0 else "counterclockwise"),
                     },
                     sources=(
                         DeviceSourceReference(
@@ -810,7 +832,9 @@ class ElgatoDockDevice:
         controls: list[ControlDescriptor] = []
         touchscreen = self._safe_image_format("touchscreen_image_format")
         touchscreen_size = _image_format_size(touchscreen or {})
-        if touchscreen_size is not None and _image_format_is_supported(touchscreen or {}):
+        if touchscreen_size is not None and _image_format_is_supported(
+            touchscreen or {}
+        ):
             width, height = touchscreen_size
             rotation = _image_format_rotation(touchscreen or {})
             self._raster_surfaces["touchscreen.0"] = _RasterSurface(
@@ -968,7 +992,9 @@ async def launch_device(device: StreamDeck) -> AsyncIterator[ElgatoDockDevice | 
         logger.info("Elgato device opened: %s", dock_device.id)
         yield dock_device
     except Exception as exc:
-        logger.warning("Could not open Elgato StreamDeck device: %s", exc, exc_info=True)
+        logger.warning(
+            "Could not open Elgato StreamDeck device: %s", exc, exc_info=True
+        )
         yield None
     finally:
         try:

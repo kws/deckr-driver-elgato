@@ -24,6 +24,7 @@ from deckr.hardware import (
     HardwareBeaconPayload,
     HardwareClaimDevice,
     HardwareClaimTerms,
+    HardwareCommandContext,
     HardwareManagerRuntime,
 )
 from message_bus_mocks import mock_deckr
@@ -35,6 +36,64 @@ from deckr.drivers.elgato._device import ElgatoDockDevice
 from deckr.drivers.elgato._discovery import ElgatoDeviceSupervisor
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_delayed_frame_does_not_restore_output_after_claim_cancellation(
+    monkeypatch,
+):
+    raw = _FakeStreamDeck(serial="A123", path="usb-a")
+    raw.open()
+    device = ElgatoDockDevice(raw)
+    async with (
+        mock_deckr() as deckr,
+        deckr.endpoint(hardware_manager_address("manager-main")) as manager,
+        deckr.endpoint(controller_address("controller-main")) as controller,
+        deckr.hardware_manager(manager, manager_id="manager-main") as runtime,
+    ):
+        runtime.command_handler = lambda context: device.handle_command(
+            context, manager_id="manager-main"
+        )
+
+        async def reset(_device_id):
+            await device.reset_outputs()
+
+        runtime.reset_handler = reset
+        await runtime.set_device(device.descriptor)
+        contract = await _claim(runtime, deckr, controller)
+        command = hw_messages.control_command_message(
+            controller_id="controller-main",
+            sender_session_id=controller.session_id,
+            manager_id="manager-main",
+            device_id=device.id,
+            control_id="key.0.0",
+            capability_id="raster.bitmap",
+            command_type="set_frame",
+            params={"image": _png_payload(), "encoding": "png"},
+            recipient_session_id=runtime.endpoint.session_id,
+            contract=contract.pointer,
+        )
+        paused, resume = anyio.Event(), anyio.Event()
+        original = anyio.to_thread.run_sync
+
+        async def delayed_thread(function, *args, **kwargs):
+            if function.__name__ == "guarded":
+                paused.set()
+                await resume.wait()
+            return await original(function, *args, **kwargs)
+
+        monkeypatch.setattr(anyio.to_thread, "run_sync", delayed_thread)
+        async with anyio.create_task_group() as tasks:
+            tasks.start_soon(runtime._handle_command, command)
+            with anyio.fail_after(2):
+                await paused.wait()
+            await deckr.concord._cancel(contract, controller.address, reason="test")
+            await deckr.concord.wait_current()
+            await runtime._reconcile_claims(reason="test cancellation")
+            assert raw.key_images[0] is None
+            resume.set()
+        assert raw.key_images[0] is None
+    await device.mark_disconnected()
+    raw.close()
 
 
 class _Transport:
@@ -426,7 +485,10 @@ async def test_device_executes_raster_and_power_commands():
         command_type="set_frame",
         params={"image": _png_payload(), "encoding": "png"},
     )
-    assert await device.handle_command(set_frame, manager_id="manager-main")
+    assert await device.handle_command(
+        HardwareCommandContext(set_frame, device.descriptor, lambda: None),
+        manager_id="manager-main",
+    )
     with Image.open(io.BytesIO(raw.key_images[0])) as rendered:
         assert rendered.format == "JPEG"
         assert rendered.size == (80, 80)
@@ -442,7 +504,10 @@ async def test_device_executes_raster_and_power_commands():
         capability_id="raster.bitmap",
         command_type="clear",
     )
-    assert await device.handle_command(clear, manager_id="manager-main")
+    assert await device.handle_command(
+        HardwareCommandContext(clear, device.descriptor, lambda: None),
+        manager_id="manager-main",
+    )
     assert raw.key_images[0] is None
 
     sleep = hw_messages.control_command_message(
@@ -461,8 +526,14 @@ async def test_device_executes_raster_and_power_commands():
         capability_id="device.power",
         command_type="wake",
     )
-    assert await device.handle_command(sleep, manager_id="manager-main")
-    assert await device.handle_command(wake, manager_id="manager-main")
+    assert await device.handle_command(
+        HardwareCommandContext(sleep, device.descriptor, lambda: None),
+        manager_id="manager-main",
+    )
+    assert await device.handle_command(
+        HardwareCommandContext(wake, device.descriptor, lambda: None),
+        manager_id="manager-main",
+    )
     assert raw.brightness_values == [0, 100]
 
 
@@ -493,7 +564,13 @@ async def test_invalid_or_misdirected_raster_commands_do_not_write_hardware(
         params={"image": image, "encoding": "png"},
     )
 
-    assert await device.handle_command(command, manager_id="manager-main") is None
+    assert (
+        await device.handle_command(
+            HardwareCommandContext(command, device.descriptor, lambda: None),
+            manager_id="manager-main",
+        )
+        is None
+    )
     assert raw.key_images == {}
     assert raw.brightness_values == []
 
@@ -613,7 +690,7 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
             runtime_context = deckr.hardware_manager(
                 manager_endpoint,
                 manager_id="manager-main",
-                command_handler=lambda envelope: supervisor.handle_command(envelope),
+                command_handler=lambda context: supervisor.handle_command(context),
                 reset_handler=lambda device_id: supervisor.reset_device(device_id),
             )
             runtime = await runtime_context.__aenter__()
@@ -701,6 +778,9 @@ async def test_supervisor_advertises_all_devices_and_routes_claimed_input():
                         ContractValidityStatus.CANCELLED
                     ):
                         await anyio.sleep(0.01)
+                await runtime.wait_for_state(
+                    lambda state: not state.claims, timeout_seconds=2
+                )
                 assert runtime.live_claims == ()
                 assert raw_a.reset_count == 1
 

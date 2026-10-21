@@ -29,6 +29,10 @@ Duplicate USB interfaces are ignored without resetting the display, removing the
 active device, or cancelling its claim. Only the registered interface owns device
 cleanup.
 
+Output handlers retain the core `HardwareCommandContext` through image conversion
+and worker-thread waits. The core rechecks the original claim immediately before
+blocking device writes, so cancelled or replaced claims cannot restore old output.
+
 ## Development
 
 The `deckr` Python distribution now comes from the sibling
@@ -46,7 +50,7 @@ it without the parent workspace source override:
 
 ```bash
 (cd ../deckr-core-python && uv build --wheel)
-uv sync --no-sources --dev --find-links ../deckr-core-python/dist
+uv sync --locked --no-sources --dev --find-links ../deckr-core-python/dist
 uv run --no-sync pytest
 ```
 
